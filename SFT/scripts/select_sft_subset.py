@@ -67,6 +67,9 @@ EXEC_FAIL_RE = re.compile(r"^\s*(tool execution error|traceback|error\s*:|\[erro
 
 
 def is_exec_failure(val: str) -> bool:
+    # Search-VL-SFT-36K wraps every tool output in <observation>...</observation>.
+    val = re.sub(r"^\s*<observation>\s*", "", val)
+    val = re.sub(r"\s*</observation>\s*$", "", val)
     try:
         obj = json.loads(val)
     except Exception:

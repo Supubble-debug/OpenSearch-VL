@@ -55,3 +55,11 @@ def test_error_word_inside_results_is_not_a_failure():
 def test_error_without_later_success_is_not_recovery():
     err, info = check(("a", "x"), ("b", "Error: upstream unavailable"))
     assert err is None and info["tool_error"] and not info["recovered_after_error"]
+
+
+def test_observation_tag_wrapper_is_stripped():
+    wrapped = "<observation> Tool execution error: Layout parsing error: Read timed out </observation>"
+    err, info = check(("a", wrapped), ("a", "<observation> found it </observation>"))
+    assert err is None and info["tool_error"] and info["recovered_after_error"]
+    assert check(("a", "<observation> Error: Image reference 'img_1' not found. </observation>"), ("b", "x"))[1]["tool_error"]
+    assert not check(("a", "<observation> Tool execution result: [{'title': 'error codes'}] </observation>"), ("b", "y"))[1]["tool_error"]
