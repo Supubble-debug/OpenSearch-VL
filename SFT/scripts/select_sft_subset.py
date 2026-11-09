@@ -61,8 +61,21 @@ SOURCES = {
 }
 ENHANCE_TOOLS = {"sharpen", "super_resolution", "perspective_correct"}
 CROP_OCR_TOOLS = {"crop", "layout_parsing"}
-# Heuristic, report-only: observation looks like a failed tool call.
-TOOL_ERROR_RE = re.compile(r"tool execution error|\berror\b|failed to|timed? ?out|no results? found", re.I)
+# A failed tool *execution*; an empty result is a successful call. Anchored at the start:
+# search results often contain words like "error" or "timeout" in page text.
+EXEC_FAIL_RE = re.compile(r"^\s*(tool execution error|traceback|error\s*:|\[error\])", re.I)
+
+
+def is_exec_failure(val: str) -> bool:
+    try:
+        obj = json.loads(val)
+    except Exception:
+        return bool(EXEC_FAIL_RE.search(val[:300]))
+    if isinstance(obj, dict):
+        if obj.get("success") is False:
+            return True
+        return obj.get("error") not in (None, "", False)
+    return False
 RETRIEVAL_TOOLS = {"text_search", "image_search", "web_search", "visit"}
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S)
 EVAL_Q_PREFIX_RE = re.compile(r"^\s*image_id:.*?Question:\s*", re.S | re.I)
@@ -118,7 +131,8 @@ def phash_int(img) -> int:
 # ─────────────────────── per-sample structure check ──────────────────────
 def check_structure(sample: dict) -> tuple[str | None, dict]:
     conv = sample.get("conversations") or []
-    info = {"tools": [], "n_calls": 0, "tool_error": False}
+    info = {"tools": [], "n_calls": 0, "tool_error": False, "recovered_after_error": False}
+    recovery_pending = False
     seen_calls, pending = set(), None
     if len(conv) < 2 or conv[0].get("from") != "human":
         return "struct:first_not_human", info
@@ -180,10 +194,15 @@ def check_structure(sample: dict) -> tuple[str | None, dict]:
                 info["tools"].append(name)
             expect = "observation"
         else:  # observation
-            if TOOL_ERROR_RE.search(val[:600]):
-                info["tool_error"] = True  # report-only: error-then-recover examples
+            if is_exec_failure(val):
+                info["tool_error"] = True  # a failed call may be retried verbatim
+                recovery_pending = True
             elif pending is not None:
-                seen_calls.add(pending)  # a failed call may be retried verbatim
+                seen_calls.add(pending)
+                if recovery_pending:  # a later call succeeded (and the sample ends in <response>)
+                    info["recovered_after_error"] = True
+                    recovery_pending = False
+            pending = None
             expect = "gpt"
     if conv[-1].get("from") != "gpt":
         return "end:last_not_gpt", info
@@ -416,6 +435,7 @@ def main() -> None:
             records.append({"id": sid, "source": src, "cat": cat, "tools": info["tools"],
                             "n_calls": info["n_calls"], "boxed": info.get("boxed", "none"),
                             "tool_error": info["tool_error"],
+                            "recovered_after_error": info["recovered_after_error"],
                             "images": abs_imgs, "sample": s})
     print(f"[struct] {len(records)} passed structure; reasons={dict(reasons)}", flush=True)
     unknown = set(tool_hist) - ENHANCE_TOOLS - CROP_OCR_TOOLS - RETRIEVAL_TOOLS - {"PythonInterpreter", "python_interpreter"}
@@ -569,7 +589,10 @@ def main() -> None:
         "selected_by_category_source": dist(lambda r: f"{r['cat']}/{r['source']}"),
         "selected_tool_calls_hist": dist(lambda r: turn_bin(r["n_calls"])),
         "selected_answer_boxed_style": dist(lambda r: r["boxed"]),
-        "selected_with_tool_error_then_response": sum(r["tool_error"] for r in selected),
+        "selected_with_tool_error": sum(r["tool_error"] for r in selected),
+        "selected_recovered_after_error": sum(r["recovered_after_error"] for r in selected),
+        "pool_with_tool_error": sum(r["tool_error"] for v in pools.values() for r in v),
+        "pool_recovered_after_error": sum(r["recovered_after_error"] for v in pools.values() for r in v),
         "selected_tool_usage": dict(collections.Counter(t for r in selected for t in r["tools"]).most_common()),
         "selected_samples_using_tool": dict(collections.Counter(t for r in selected for t in set(r["tools"])).most_common()),
         "selected_tokens": {"min": sel_tokens[0], "p50": sel_tokens[len(sel_tokens) // 2],

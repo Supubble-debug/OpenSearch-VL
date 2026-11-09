@@ -2,7 +2,7 @@
 #
 # User-specified: LoRA rank 32 · ≈60% retrieval / 30% crop+OCR / 10% enhancement
 # (SFT/scripts/select_sft_subset.py) · lr 1e-4 · batch size 4 · 1 epoch.
-# Sample count pending user confirmation: 4096 (1024 updates) proposed, 2048 (512) as before.
+# 4096 samples / 1024 updates (user-confirmed 2026-11-09).
 # Template and image budget follow the paper's Qwen3-VL SFT configs (examples/agentic_full/).
 # Launch with FORCE_TORCHRUN=1 (both GPUs; the summariser is not needed during SFT).
 
@@ -38,7 +38,7 @@ logging_steps: 5
 save_steps: 128                     # 8 checkpoints over 1024 updates (use 64 for 2048 samples)
 save_total_limit: 8
 plot_loss: true
-overwrite_output_dir: true
+overwrite_output_dir: false             # never clobber a finished run; a crashed run resumes from its last checkpoint
 save_only_model: false
 report_to: wandb                    # launcher runs WANDB_MODE=offline (api.wandb.ai 403 from westd)
 run_name: qwen3_vl_4b_lora_sft
