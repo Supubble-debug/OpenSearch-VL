@@ -411,6 +411,10 @@ def main() -> None:
     reasons_by_src = collections.defaultdict(collections.Counter)
     tool_hist = collections.Counter()
     records = []
+    excluded_ids, excluded_raw = set(), {}
+    if args.exclude_manifest:
+        with open(args.exclude_manifest, encoding="utf-8") as fh:
+            excluded_ids = {json.loads(line)["id"] for line in fh}
 
     # 1. structure + categorisation
     for src, fname in SOURCES.items():
@@ -419,6 +423,9 @@ def main() -> None:
         print(f"[load] {src}: {len(data)} samples", flush=True)
         for idx, s in enumerate(data):
             sid = f"{src}:{idx}"
+            if sid in excluded_ids:  # held-out samples join the overlap check even if filtered out below
+                excluded_raw[sid] = (s, [str((src_dir / p).resolve()) if not os.path.isabs(p) else p
+                                         for p in s.get("images") or []])
             err, info = check_structure(s)
             for t in info["tools"]:
                 tool_hist[t] += 1
@@ -467,8 +474,7 @@ def main() -> None:
     # question or primary image with it (handled like a test set below).
     train_items = []
     if args.exclude_manifest:
-        with open(args.exclude_manifest, encoding="utf-8") as fh:
-            excluded = {json.loads(line)["id"] for line in fh}
+        excluded = excluded_ids
         kept = []
         for r in records:
             if r["id"] not in excluded:
@@ -478,6 +484,16 @@ def main() -> None:
             train_items.append({"bench": "exclude_manifest", "id": r["id"], "qnorm": q,
                                 "phashes": [] if r["phash"] is None else [r["phash"]], "q": q[:200]})
             reasons["excluded:manifest"] += 1
+        # Held-out samples dropped by the new filters (loops, --keep-ids) still count for overlap.
+        found = {t["id"] for t in train_items}
+        for sid in sorted(excluded - found):
+            if sid not in excluded_raw:
+                continue
+            raw, paths = excluded_raw[sid]
+            _, _, ph = check_images((paths, True)) if paths else (None, [], None)
+            q = norm_text(raw["conversations"][0]["value"])
+            train_items.append({"bench": "exclude_manifest", "id": sid, "qnorm": q,
+                                "phashes": [] if ph is None else [ph], "q": q[:200]})
         assert len(train_items) == len(excluded), (
             f"only {len(train_items)}/{len(excluded)} excluded samples found; their overlap check would be incomplete")
         records = kept
