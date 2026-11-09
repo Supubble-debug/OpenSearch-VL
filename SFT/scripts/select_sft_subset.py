@@ -381,6 +381,8 @@ def main() -> None:
     ap.add_argument("--dataset-name", default="imagentrl_sft_2048", help="key in the written dataset_info.json")
     ap.add_argument("--exclude-manifest", default=None,
                     help="manifest.jsonl of a subset to hold out from: its samples and overlaps are removed")
+    ap.add_argument("--keep-ids", default=None,
+                    help="file with one sample id per line; only these are eligible (e.g. answer-checked candidates)")
     ap.add_argument("--n", type=int, default=2048)
     ap.add_argument("--ratios", default="retrieval=0.6,crop_ocr=0.3,enhancement=0.1")
     ap.add_argument("--cutoff-len", type=int, default=32000)
@@ -438,6 +440,11 @@ def main() -> None:
                             "recovered_after_error": info["recovered_after_error"],
                             "images": abs_imgs, "sample": s})
     print(f"[struct] {len(records)} passed structure; reasons={dict(reasons)}", flush=True)
+    if args.keep_ids:
+        keep = {line.strip() for line in open(args.keep_ids, encoding="utf-8") if line.strip()}
+        reasons["not_in_keep_ids"] += sum(r["id"] not in keep for r in records)
+        records = [r for r in records if r["id"] in keep]
+        print(f"[keep-ids] {len(records)} of {len(keep)} listed ids remain eligible", flush=True)
     unknown = set(tool_hist) - ENHANCE_TOOLS - CROP_OCR_TOOLS - RETRIEVAL_TOOLS - {"PythonInterpreter", "python_interpreter"}
     if unknown:
         print(f"[warn] tool names outside known sets: {sorted(unknown)}", flush=True)

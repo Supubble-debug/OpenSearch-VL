@@ -32,6 +32,7 @@ def main() -> int:
     ap.add_argument("--work", required=True)
     ap.add_argument("--best-file", required=True)
     ap.add_argument("--lanes", type=int, default=3)
+    ap.add_argument("--template", default="qwen3_5", help="must match the SFT config (qwen3_vl for Qwen3-VL)")
     ap.add_argument("--keep-margin", type=float, default=0.005)
     args = ap.parse_args()
 
@@ -55,7 +56,7 @@ def main() -> int:
                 "model_name_or_path": args.model, "image_max_pixels": 262144, "trust_remote_code": True,
                 "enable_liger_kernel": True, "stage": "sft", "do_train": False, "do_eval": True,
                 "finetuning_type": "lora", "dataset_dir": args.dataset_dir, "eval_dataset": args.dataset_name,
-                "template": "qwen3_5", "cutoff_len": 32000, "overwrite_cache": False,
+                "template": args.template, "cutoff_len": 32000, "overwrite_cache": False,
                 "preprocessing_num_workers": 16, "dataloader_num_workers": 2, "output_dir": str(out),
                 "overwrite_output_dir": True, "per_device_eval_batch_size": 1, "predict_with_generate": False,
                 "prediction_loss_only": True, "report_to": "none", "bf16": True, "seed": 42,
