@@ -789,7 +789,8 @@ class Qwen35SFTRunner(BaseRunner):
         self._processor.image_max_pixels = self.image_max_pixels
         self._processor.image_min_pixels = 32 * 32
         self._processor.image_do_pad = False
-        self._template = TEMPLATES["qwen3_5"]
+        # qwen3_5 (default) or qwen3_vl: the LLaMA-Factory template the adapter was trained with.
+        self._template = TEMPLATES[self.spec.extra.get("lf_template", "qwen3_5")]
         if self.tool_prompt == "json":
             from llamafactory.data.formatter import ToolFormatter  # type: ignore
 
@@ -897,7 +898,7 @@ class Qwen35SFTRunner(BaseRunner):
                 )
             text, gen_len, finish = self._generate_ids(prompt_ids, images, cfg)
         except Exception as exc:
-            logger.error("Qwen3.5 inference failed: %s", exc, exc_info=True)
+            logger.error("%s inference failed: %s", self.spec.display_name, exc, exc_info=True)
             return _empty_response(self.display_name, str(exc))
         return {
             "candidates": [

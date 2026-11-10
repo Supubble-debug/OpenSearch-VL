@@ -15,6 +15,8 @@ ADAPTER=${ADAPTER:-/root/autodl-fs/runs/imagentrl/exp-main/run-20261103-144117-3
 export PATH="$SFT_ENV/bin:/root/miniconda3/bin:$PATH"
 export TOKENIZERS_PARALLELISM=false PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export QWEN35_4B_PATH=${QWEN35_4B_PATH:-/root/models/Qwen3.5-4B}
+export QWEN3VL_4B_PATH=${QWEN3VL_4B_PATH:-/root/models/Qwen3-VL-4B-Instruct}
+MODEL=${MODEL:-qwen3.5-4b}  # qwen3-vl-4b for the Qwen3-VL SFT
 # Longest SFT trajectory has 8 assistant turns; p99 assistant message ≈ 1k tokens.
 export AGENT_MAX_TURNS=${AGENT_MAX_TURNS:-15}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-4096}
@@ -78,7 +80,7 @@ for tag in $TAGS; do
   esac
   mkdir -p "$WORK/$tag"
   for i in $(seq 0 $((SHARDS - 1))); do
-    python "$HERE/run_infer.py" --model qwen3.5-4b --gpus 0 --dataset test \
+    python "$HERE/run_infer.py" --model "$MODEL" --gpus 0 --dataset test \
       --data-path "$CASES" --output-dir "$WORK/$tag" --shard "$i/$SHARDS" --skip-existing \
       --max-tokens "$MAX_NEW_TOKENS" --log-level WARNING "${extra[@]}" \
       > "$OUTPUT_ROOT/infer_${tag}_$i.log" 2>&1 &
