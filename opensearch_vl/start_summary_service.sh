@@ -8,6 +8,6 @@ MODEL=${SUMMARY_MODEL_PATH:-/root/autodl-fs/models/Qwen3.8-27B-FP8}
 export CUDA_VISIBLE_DEVICES=${SUMMARY_GPU:-1}
 # Prompts are <= 6000 chars of page text + 1024 output tokens; 16k leaves headroom.
 exec /root/venvs/vllm/bin/vllm serve "$MODEL" \
-  --served-model-name summariser --host 127.0.0.1 --port 8000 \
+  --served-model-name summariser --host 127.0.0.1 --port ${SUMMARY_PORT:-8000} \
   --max-model-len ${SUMMARY_MAX_LEN:-16384} --gpu-memory-utilization 0.90 \
   --limit-mm-per-prompt "{\"image\": ${SUMMARY_MAX_IMAGES:-0}, \"video\": 0}"
