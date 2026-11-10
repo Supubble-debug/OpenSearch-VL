@@ -153,23 +153,38 @@ def build_prompt(sample: dict, tok, max_tokens: int, task: str = TASK, **extra) 
     return None
 
 
-def judge(api: str, model: str, prompt: str, images: list[str] | None = None, system: str = SYSTEM) -> dict:
+def _parse_verdict(text: str) -> dict:
+    """Last JSON object after any <think> block that has the verdict keys."""
+    text = text.rsplit("</think>", 1)[-1]
+    for cand in reversed(re.findall(r"\{[^{}]*\}", text, re.S)):
+        try:
+            out = json.loads(cand)
+        except ValueError:
+            continue
+        if all(k in out for k in ("supported", "contradicted", "granularity_ok")):
+            return out
+    return {}
+
+
+def judge(api: str, model: str, prompt: str, images: list[str] | None = None, system: str = SYSTEM,
+          thinking: bool = False) -> dict:
     content = ([{"type": "image_url", "image_url": {"url": u}} for u in images] + [{"type": "text", "text": prompt}]
                if images else prompt)
     body = {
-        "model": model, "temperature": 0.0, "max_tokens": 200,
+        "model": model, "max_tokens": 6000 if thinking else 200,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": thinking},
+        # greedy decoding loops in long thinking; Qwen's recommended thinking sampling instead
+        **({"temperature": 0.6, "top_p": 0.95, "top_k": 20} if thinking else {"temperature": 0.0}),
     }
     last = ""
     for attempt in range(4):
         try:
-            r = requests.post(f"{api}/chat/completions", json=body, timeout=300)
+            r = requests.post(f"{api}/chat/completions", json=body, timeout=900)
             if r.status_code == 200:
-                text = r.json()["choices"][0]["message"]["content"]
-                m = re.search(r"\{.*\}", text, re.S)
-                out = json.loads(m.group(0)) if m else {}
-                if all(k in out for k in ("supported", "contradicted", "granularity_ok")):
+                text = r.json()["choices"][0]["message"].get("content") or ""
+                out = _parse_verdict(text)
+                if out:
                     return {k: str(out[k]).strip().lower() if k != "reason" else out[k] for k in out}
                 last = f"unparsable: {text[:200]}"
             else:
@@ -201,6 +216,8 @@ def main() -> int:
     ap.add_argument("--model", default="summariser")
     ap.add_argument("--max-prompt-tokens", type=int, default=14500)
     ap.add_argument("--workers", type=int, default=48)
+    ap.add_argument("--thinking", action="store_true",
+                    help="let the judge reason before the verdict (slower; server needs SUMMARY_MAX_LEN>=24k)")
     ap.add_argument("--images", type=int, default=0,
                     help="attach up to N trajectory images (question image + latest tool images); "
                          "the server must accept images (SUMMARY_MAX_IMAGES>=N)")
@@ -255,11 +272,12 @@ def main() -> int:
             # 512x512 at 32 px per merged token = 256 tokens per image (+ markers)
             prompt = build_prompt(data[sid], tok, args.max_prompt_tokens - 300 * len(imgs), task=TASK_VISION,
                                   image_list=names or "none")
-            v = (judge(args.api, args.model, prompt, imgs, SYSTEM_VISION) if prompt
+            v = (judge(args.api, args.model, prompt, imgs, SYSTEM_VISION, thinking=args.thinking) if prompt
                  else {"judge_failed": "prompt too long"})
         else:
             prompt = build_prompt(data[sid], tok, args.max_prompt_tokens)
-            v = judge(args.api, args.model, prompt) if prompt else {"judge_failed": "prompt too long"}
+            v = (judge(args.api, args.model, prompt, thinking=args.thinking) if prompt
+                 else {"judge_failed": "prompt too long"})
         return {"id": sid, "cat": cats.get(sid), "source": sid.split(":")[0], **v}
 
     t0 = time.time()
