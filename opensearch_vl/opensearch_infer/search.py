@@ -17,6 +17,7 @@ the tool returns a clear, recoverable error message instead of raising.
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -29,7 +30,7 @@ from typing import Callable, Dict, List, Optional
 import requests
 from PIL import Image
 
-from . import config
+from . import config, tool_cache
 
 
 logger = logging.getLogger(__name__)
@@ -440,6 +441,11 @@ def _deepseek_fetch(url: str) -> str:
 def _text_search_deepseek(query: str, top_k: int) -> str:
     """DeepSeek Search -> page text (search index, else Fetch) -> summaries."""
     top_k = max(1, min(int(top_k), 10))
+    k = tool_cache.key("text_search", query.strip(), top_k, config.QWEN_MODEL_NAME)
+    return tool_cache.cached("text_search", k, lambda: _text_search_deepseek_uncached(query, top_k))
+
+
+def _text_search_deepseek_uncached(query: str, top_k: int) -> str:
     payload = {
         "query": query.strip()[:_DEEPSEEK_QUERY_MAX_CHARS],
         "count": top_k,
@@ -512,6 +518,11 @@ def _encode_for_visual_search(image_bytes: bytes) -> bytes:
 
 def image_search_bytes(image_bytes: bytes, attempts: int = 4) -> str:
     """Visual search by image content; no public URL or object storage needed."""
+    k = tool_cache.key("image_search", hashlib.sha256(image_bytes).hexdigest(), config.IMAGE_SEARCH_DOC_COUNT)
+    return tool_cache.cached("image_search", k, lambda: _image_search_bytes_uncached(image_bytes, attempts))
+
+
+def _image_search_bytes_uncached(image_bytes: bytes, attempts: int = 4) -> str:
     try:
         encoded = _encode_for_visual_search(image_bytes)
     except Exception as exc:

@@ -1,0 +1,13 @@
+# Merge the chosen SFT LoRA (val loss 0.557, checkpoint-1024) into Qwen3-VL-4B-Instruct.
+# The merged model is served by vLLM for probe rollouts and is the RL starting point
+# (and reference policy).
+#   llamafactory-cli export SFT/examples/imagentrl/qwen3_vl_4b_merge.yaml
+model_name_or_path: /root/models/Qwen3-VL-4B-Instruct
+adapter_name_or_path: /root/sft-runs/qwen3_vl_4b_lora_sft/checkpoint-1024
+template: qwen3_vl
+finetuning_type: lora
+trust_remote_code: true
+export_dir: /root/models/qwen3vl4b-sft-merged
+export_size: 5
+export_device: cpu
+export_legacy_format: false

@@ -41,7 +41,9 @@ import json
 import logging
 import os
 import sys
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import pandas as pd
@@ -169,6 +171,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Sampling temperature (0 disables sampling).",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Cases run concurrently in this process (useful with the vLLM backend).",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -248,36 +256,46 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     shard_i, shard_k = (int(x) for x in args.shard.split("/"))
-    success, failure = 0, 0
+    todo = []
     for idx in range(start, end):
         if idx % shard_k != shard_i:
             continue
+        row = df.iloc[idx]
+        if args.skip_existing and _already_done(
+            os.path.join(args.output_dir, f"{row.get('data_id', f'case_{idx}')}_trajectory.json")
+        ):
+            continue
+        todo.append(idx)
+
+    stop = threading.Event()
+
+    def run_one(idx: int) -> str:
+        if stop.is_set():
+            return "skipped"
         try:
-            row = df.iloc[idx]
-            if args.skip_existing and _already_done(
-                os.path.join(
-                    args.output_dir,
-                    f"{row.get('data_id', f'case_{idx}')}_trajectory.json",
-                )
-            ):
-                continue
             pipeline.process_single_case(
-                row=row,
+                row=df.iloc[idx],
                 runner=runner,
                 output_dir=args.output_dir,
                 case_idx=idx,
                 dataset_type=args.dataset,
                 inference_cfg=inference_cfg,
             )
-            success += 1
+            return "ok"
         except FatalServiceError as exc:
+            stop.set()
             logger.error("Stopping: %s. Fix it and re-run with --skip-existing.", exc)
-            return 3
+            return "fatal"
         except Exception as exc:
-            failure += 1
             logger.error("Case %d failed: %s", idx, exc)
             traceback.print_exc()
+            return "failed"
 
+    with ThreadPoolExecutor(max(1, args.workers)) as pool:
+        results = list(pool.map(run_one, todo))
+    success, failure = results.count("ok"), results.count("failed")
+    if "fatal" in results:
+        return 3
     logger.info("Done. success=%d failure=%d output=%s", success, failure, args.output_dir)
     return 0
 
