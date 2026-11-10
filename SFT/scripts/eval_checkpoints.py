@@ -48,6 +48,15 @@ def main() -> int:
     env = {**os.environ, "FORCE_TORCHRUN": "0", "WANDB_DISABLED": "true", "TOKENIZERS_PARALLELISM": "false",
            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
 
+    # One GPU per lane: with several GPUs visible LLaMA-Factory torchruns every lane on all of
+    # them, so parallel lanes stack up and OOM. Lanes = number of GPUs.
+    import queue
+    gpus = [g for g in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if g] or \
+        [str(i) for i in range(int(subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout.count("GPU ")) or 1)]
+    free = queue.Queue()
+    for g in gpus[: max(1, args.lanes)]:
+        free.put(g)
+
     def run(name: str, adapter: str | None) -> float | None:
         out = work / name
         result = out / "eval_results.json"
@@ -66,8 +75,13 @@ def main() -> int:
             out.mkdir(parents=True, exist_ok=True)
             config = work / f"{name}.yaml"
             config.write_text(yaml.safe_dump(cfg))
-            with open(work / f"{name}.log", "w") as log:
-                code = subprocess.call(["llamafactory-cli", "train", str(config)], stdout=log, stderr=subprocess.STDOUT, env=env)
+            gpu = free.get()
+            try:
+                with open(work / f"{name}.log", "w") as log:
+                    code = subprocess.call(["llamafactory-cli", "train", str(config)], stdout=log,
+                                           stderr=subprocess.STDOUT, env={**env, "CUDA_VISIBLE_DEVICES": gpu})
+            finally:
+                free.put(gpu)
             if code != 0 or not result.exists():
                 print(f"{name}: failed (exit {code}), see {work / (name + '.log')}", flush=True)
                 return None
@@ -78,7 +92,7 @@ def main() -> int:
     losses: dict[str, float | None] = {"base": run("base", None)}  # also fills the preprocessing cache
     if losses["base"] is None:
         return 1
-    with ThreadPoolExecutor(args.lanes) as pool:
+    with ThreadPoolExecutor(free.qsize()) as pool:
         for ckpt, loss in zip(ckpts, pool.map(lambda c: run(c.name, str(c)), ckpts)):
             losses[ckpt.name] = loss
     for ckpt in ckpts:  # a long sample can OOM when lanes overlap; retry alone
