@@ -15,7 +15,8 @@ Pipeline
      unbalanced one is rejected);
    - images: ``<image>`` count == len(images); every file exists, decodes,
      is ≥ 28 px per side and has aspect ratio < 200 (Qwen processor limits);
-   - length: text tokens (Qwen3.5 tokenizer) + vision tokens (smart_resize at
+   - loops: the same tool call (name + arguments) twice in one trajectory;
+   - length: text tokens (target model's tokenizer) + vision tokens (smart_resize at
      ``--image-max-pixels``) + per-message overhead ≤ ``--cutoff-len``
      (with ``--length-margin`` slack) — samples are dropped, never truncated;
    - test overlap: question text (exact normalised match, or 5-gram Jaccard
@@ -60,6 +61,24 @@ SOURCES = {
 }
 ENHANCE_TOOLS = {"sharpen", "super_resolution", "perspective_correct"}
 CROP_OCR_TOOLS = {"crop", "layout_parsing"}
+# A failed tool *execution*; an empty result is a successful call. Anchored at the start:
+# search results often contain words like "error" or "timeout" in page text.
+EXEC_FAIL_RE = re.compile(r"^\s*(tool execution error|traceback|error\s*:|\[error\])", re.I)
+
+
+def is_exec_failure(val: str) -> bool:
+    # Search-VL-SFT-36K wraps every tool output in <observation>...</observation>.
+    val = re.sub(r"^\s*<observation>\s*", "", val)
+    val = re.sub(r"\s*</observation>\s*$", "", val)
+    try:
+        obj = json.loads(val)
+    except Exception:
+        return bool(EXEC_FAIL_RE.search(val[:300]))
+    if isinstance(obj, dict):
+        if obj.get("success") is False:
+            return True
+        return obj.get("error") not in (None, "", False)
+    return False
 RETRIEVAL_TOOLS = {"text_search", "image_search", "web_search", "visit"}
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S)
 EVAL_Q_PREFIX_RE = re.compile(r"^\s*image_id:.*?Question:\s*", re.S | re.I)
@@ -115,7 +134,9 @@ def phash_int(img) -> int:
 # ─────────────────────── per-sample structure check ──────────────────────
 def check_structure(sample: dict) -> tuple[str | None, dict]:
     conv = sample.get("conversations") or []
-    info = {"tools": [], "n_calls": 0}
+    info = {"tools": [], "n_calls": 0, "tool_error": False, "recovered_after_error": False}
+    recovery_pending = False
+    seen_calls, pending = set(), None
     if len(conv) < 2 or conv[0].get("from") != "human":
         return "struct:first_not_human", info
     declared = set()
@@ -167,9 +188,24 @@ def check_structure(sample: dict) -> tuple[str | None, dict]:
                     return "struct:tool_call_no_args", info
                 if declared and name not in declared:
                     return f"struct:undeclared_tool({name})", info
+                # The same call twice after it already succeeded = the agent is going in circles; the Qwen3.5 SFT eval's
+                # 13 max-turn cases (all wrong) were such loops. Don't teach it.
+                key = (name, json.dumps(call["arguments"], sort_keys=True, ensure_ascii=False))
+                if key in seen_calls:
+                    return "loop:repeated_tool_call", info
+                pending = key
                 info["tools"].append(name)
             expect = "observation"
         else:  # observation
+            if is_exec_failure(val):
+                info["tool_error"] = True  # a failed call may be retried verbatim
+                recovery_pending = True
+            elif pending is not None:
+                seen_calls.add(pending)
+                if recovery_pending:  # a later call succeeded (and the sample ends in <response>)
+                    info["recovered_after_error"] = True
+                    recovery_pending = False
+            pending = None
             expect = "gpt"
     if conv[-1].get("from") != "gpt":
         return "end:last_not_gpt", info
@@ -343,11 +379,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-root", required=True)
     ap.add_argument("--eval", nargs="*", default=[], help="eval parquet files for overlap check")
-    ap.add_argument("--model", required=True, help="tokenizer / processor path (Qwen3.5)")
+    ap.add_argument("--model", required=True, help="tokenizer / processor path (the model being fine-tuned)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--dataset-name", default="imagentrl_sft_2048", help="key in the written dataset_info.json")
     ap.add_argument("--exclude-manifest", default=None,
                     help="manifest.jsonl of a subset to hold out from: its samples and overlaps are removed")
+    ap.add_argument("--keep-ids", default=None,
+                    help="file with one sample id per line; only these are eligible (e.g. answer-checked candidates)")
     ap.add_argument("--n", type=int, default=2048)
     ap.add_argument("--ratios", default="retrieval=0.6,crop_ocr=0.3,enhancement=0.1")
     ap.add_argument("--cutoff-len", type=int, default=32000)
@@ -376,6 +414,10 @@ def main() -> None:
     reasons_by_src = collections.defaultdict(collections.Counter)
     tool_hist = collections.Counter()
     records = []
+    excluded_ids, excluded_raw = set(), {}
+    if args.exclude_manifest:
+        with open(args.exclude_manifest, encoding="utf-8") as fh:
+            excluded_ids = {json.loads(line)["id"] for line in fh}
 
     # 1. structure + categorisation
     for src, fname in SOURCES.items():
@@ -384,6 +426,9 @@ def main() -> None:
         print(f"[load] {src}: {len(data)} samples", flush=True)
         for idx, s in enumerate(data):
             sid = f"{src}:{idx}"
+            if sid in excluded_ids:  # held-out samples join the overlap check even if filtered out below
+                excluded_raw[sid] = (s, [str((src_dir / p).resolve()) if not os.path.isabs(p) else p
+                                         for p in s.get("images") or []])
             err, info = check_structure(s)
             for t in info["tools"]:
                 tool_hist[t] += 1
@@ -401,8 +446,15 @@ def main() -> None:
             abs_imgs = [str((src_dir / p).resolve()) if not os.path.isabs(p) else p for p in imgs]
             records.append({"id": sid, "source": src, "cat": cat, "tools": info["tools"],
                             "n_calls": info["n_calls"], "boxed": info.get("boxed", "none"),
+                            "tool_error": info["tool_error"],
+                            "recovered_after_error": info["recovered_after_error"],
                             "images": abs_imgs, "sample": s})
     print(f"[struct] {len(records)} passed structure; reasons={dict(reasons)}", flush=True)
+    if args.keep_ids:
+        keep = {line.strip() for line in open(args.keep_ids, encoding="utf-8") if line.strip()}
+        reasons["not_in_keep_ids"] += sum(r["id"] not in keep for r in records)
+        records = [r for r in records if r["id"] in keep]
+        print(f"[keep-ids] {len(records)} of {len(keep)} listed ids remain eligible", flush=True)
     unknown = set(tool_hist) - ENHANCE_TOOLS - CROP_OCR_TOOLS - RETRIEVAL_TOOLS - {"PythonInterpreter", "python_interpreter"}
     if unknown:
         print(f"[warn] tool names outside known sets: {sorted(unknown)}", flush=True)
@@ -425,8 +477,7 @@ def main() -> None:
     # question or primary image with it (handled like a test set below).
     train_items = []
     if args.exclude_manifest:
-        with open(args.exclude_manifest, encoding="utf-8") as fh:
-            excluded = {json.loads(line)["id"] for line in fh}
+        excluded = excluded_ids
         kept = []
         for r in records:
             if r["id"] not in excluded:
@@ -436,6 +487,16 @@ def main() -> None:
             train_items.append({"bench": "exclude_manifest", "id": r["id"], "qnorm": q,
                                 "phashes": [] if r["phash"] is None else [r["phash"]], "q": q[:200]})
             reasons["excluded:manifest"] += 1
+        # Held-out samples dropped by the new filters (loops, --keep-ids) still count for overlap.
+        found = {t["id"] for t in train_items}
+        for sid in sorted(excluded - found):
+            if sid not in excluded_raw:
+                continue
+            raw, paths = excluded_raw[sid]
+            _, _, ph = check_images((paths, True)) if paths else (None, [], None)
+            q = norm_text(raw["conversations"][0]["value"])
+            train_items.append({"bench": "exclude_manifest", "id": sid, "qnorm": q,
+                                "phashes": [] if ph is None else [ph], "q": q[:200]})
         assert len(train_items) == len(excluded), (
             f"only {len(train_items)}/{len(excluded)} excluded samples found; their overlap check would be incomplete")
         records = kept
@@ -554,6 +615,10 @@ def main() -> None:
         "selected_by_category_source": dist(lambda r: f"{r['cat']}/{r['source']}"),
         "selected_tool_calls_hist": dist(lambda r: turn_bin(r["n_calls"])),
         "selected_answer_boxed_style": dist(lambda r: r["boxed"]),
+        "selected_with_tool_error": sum(r["tool_error"] for r in selected),
+        "selected_recovered_after_error": sum(r["recovered_after_error"] for r in selected),
+        "pool_with_tool_error": sum(r["tool_error"] for v in pools.values() for r in v),
+        "pool_recovered_after_error": sum(r["recovered_after_error"] for v in pools.values() for r in v),
         "selected_tool_usage": dict(collections.Counter(t for r in selected for t in r["tools"]).most_common()),
         "selected_samples_using_tool": dict(collections.Counter(t for r in selected for t in set(r["tools"])).most_common()),
         "selected_tokens": {"min": sel_tokens[0], "p50": sel_tokens[len(sel_tokens) // 2],

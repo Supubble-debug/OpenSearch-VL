@@ -52,6 +52,27 @@ JUDGE_PROMPT = (
 )
 
 
+# Stricter variant for RL rewards / probes: the lenient prompt above credits a long answer
+# that lists several candidates if any of them matches, which rewards hedging.
+JUDGE_PROMPT_STRICT = (
+    "You are an impartial judge grading the final answer of a research agent.\n\n"
+    "[Question]\n{question}\n\n"
+    "[Correct Answer]\n{correct_answer}\n\n"
+    "[Agent Final Answer]\n{response}\n\n"
+    "Decide whether the agent's final answer is correct.\n"
+    "1. Identify the answer the agent commits to. Paraphrases, translations, aliases and extra correct detail are fine.\n"
+    "2. Answer \"no\" if the agent offers several different candidate answers without committing to the correct one, "
+    "hedges between alternatives, refuses or says it cannot determine the answer, or states anything that contradicts "
+    "the correct answer for the asked item.\n"
+    "3. For multi-part questions every part must be correct.\n"
+    "4. A year or date is acceptable for a time question unless the correct answer needs finer precision.\n\n"
+    "Output format:\n"
+    "correct: [yes/no]\n"
+    "reasoning: [your explanation]"
+)
+STRICT = False
+
+
 # ======================== GPT-4o API Wrapper ========================
 
 def get_simple_auth(source: str, secret_id: str, secret_key: str):
@@ -215,7 +236,7 @@ def parse_judge_response(raw: str) -> dict:
 
 def judge_common(question: str, correct_answer: str, response: str) -> dict:
     """Unified judge using Vision-DeepResearch style prompt."""
-    prompt = JUDGE_PROMPT.format(
+    prompt = (JUDGE_PROMPT_STRICT if STRICT else JUDGE_PROMPT).format(
         question=question,
         correct_answer=correct_answer,
         response=response[:8000],
@@ -384,7 +405,10 @@ if __name__ == "__main__":
                         help="Limit number of files to evaluate (0 = all)")
     parser.add_argument("--answer_file", type=str, default=None,
                         help="Parquet file with id/answer columns (for VDR etc.)")
+    parser.add_argument("--strict", action="store_true",
+                        help="grade only the committed final answer; hedged / multi-candidate answers are wrong")
     args = parser.parse_args()
+    STRICT = args.strict
 
     run_eval(
         traj_dir=args.traj_dir,

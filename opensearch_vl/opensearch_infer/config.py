@@ -243,6 +243,26 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
         default_checkpoint="Qwen/Qwen3.5-4B",
         supports_multi_gpu=False,
     ),
+    # Qwen3-VL rendered through LLaMA-Factory's qwen3_vl template, exactly as in our SFT.
+    "qwen3-vl-4b": ModelSpec(
+        name="qwen3-vl-4b",
+        family="qwen3_5",
+        display_name="Qwen3-VL-4B-Instruct",
+        default_checkpoint_env="QWEN3VL_4B_PATH",
+        default_checkpoint="Qwen/Qwen3-VL-4B-Instruct",
+        supports_multi_gpu=False,
+        extra={"lf_template": "qwen3_vl"},
+    ),
+    # Same prompt stack, generation by vllm_token_server.py (merged SFT checkpoint).
+    "qwen3-vl-4b-vllm": ModelSpec(
+        name="qwen3-vl-4b-vllm",
+        family="qwen3_5",
+        display_name="Qwen3-VL-4B-Instruct",
+        default_checkpoint_env="QWEN3VL_4B_PATH",
+        default_checkpoint="Qwen/Qwen3-VL-4B-Instruct",
+        supports_multi_gpu=False,
+        extra={"lf_template": "qwen3_vl", "backend": "vllm"},
+    ),
     "claude": ModelSpec(
         name="claude",
         family="claude",

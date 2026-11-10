@@ -26,6 +26,7 @@ def main() -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--data", required=True)
     ap.add_argument("--samples", type=int, default=40)
+    ap.add_argument("--registry", default="qwen3.5-4b", help="model registry name (qwen3-vl-4b for Qwen3-VL)")
     args = ap.parse_args()
 
     from llamafactory.data import get_template_and_fix_tokenizer
@@ -37,13 +38,14 @@ def main() -> int:
     from opensearch_infer.runners import Qwen35SFTRunner
 
     model_args = ModelArguments(model_name_or_path=args.model, image_max_pixels=262144)
-    data_args = DataArguments(template="qwen3_5", cutoff_len=32000)
+    spec = config.MODEL_REGISTRY[args.registry]
+    data_args = DataArguments(template=spec.extra.get("lf_template", "qwen3_5"), cutoff_len=32000)
     loaded = load_tokenizer(model_args)
     tokenizer, processor = loaded["tokenizer"], loaded["processor"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
     train_proc = SupervisedDatasetProcessor(template, tokenizer, processor, data_args)
 
-    runner = Qwen35SFTRunner(config.MODEL_REGISTRY["qwen3.5-4b"], args.model)
+    runner = Qwen35SFTRunner(spec, args.model)
     runner.load_prompt_stack()
 
     data = json.load(open(args.data, encoding="utf-8"))
@@ -111,8 +113,11 @@ def main() -> int:
             assert (ours["pixel_values"] - theirs["pixel_values"]).abs().max() < 1e-4, "pixels differ"
             grids += len(images)
 
+    if data_args.template != "qwen3_5":  # only qwen3_5 has the JSON/XML tool-prompt conflict
+        print(f"OK: {len(picked)} trajectories, {checked_turns} assistant turns, {grids} images match training")
+        return 0
     # The clean baseline differs only in the appended tool instructions.
-    clean = Qwen35SFTRunner(config.MODEL_REGISTRY["qwen3.5-4b"], args.model, tool_prompt="json")
+    clean = Qwen35SFTRunner(spec, args.model, tool_prompt="json")
     clean.load_prompt_stack()
     msgs = [{"role": "user", "content": "hello"}]
     xml_text = tokenizer.decode(runner.build_prompt_ids(msgs, []))

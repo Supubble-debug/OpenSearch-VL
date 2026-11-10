@@ -32,6 +32,7 @@ def main() -> int:
     ap.add_argument("--work", required=True)
     ap.add_argument("--best-file", required=True)
     ap.add_argument("--lanes", type=int, default=3)
+    ap.add_argument("--template", default="qwen3_5", help="must match the SFT config (qwen3_vl for Qwen3-VL)")
     ap.add_argument("--keep-margin", type=float, default=0.005)
     args = ap.parse_args()
 
@@ -47,6 +48,15 @@ def main() -> int:
     env = {**os.environ, "FORCE_TORCHRUN": "0", "WANDB_DISABLED": "true", "TOKENIZERS_PARALLELISM": "false",
            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
 
+    # One GPU per lane: with several GPUs visible LLaMA-Factory torchruns every lane on all of
+    # them, so parallel lanes stack up and OOM. Lanes = number of GPUs.
+    import queue
+    gpus = [g for g in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if g] or \
+        [str(i) for i in range(int(subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout.count("GPU ")) or 1)]
+    free = queue.Queue()
+    for g in gpus[: max(1, args.lanes)]:
+        free.put(g)
+
     def run(name: str, adapter: str | None) -> float | None:
         out = work / name
         result = out / "eval_results.json"
@@ -55,7 +65,7 @@ def main() -> int:
                 "model_name_or_path": args.model, "image_max_pixels": 262144, "trust_remote_code": True,
                 "enable_liger_kernel": True, "stage": "sft", "do_train": False, "do_eval": True,
                 "finetuning_type": "lora", "dataset_dir": args.dataset_dir, "eval_dataset": args.dataset_name,
-                "template": "qwen3_5", "cutoff_len": 32000, "overwrite_cache": False,
+                "template": args.template, "cutoff_len": 32000, "overwrite_cache": False,
                 "preprocessing_num_workers": 16, "dataloader_num_workers": 2, "output_dir": str(out),
                 "overwrite_output_dir": True, "per_device_eval_batch_size": 1, "predict_with_generate": False,
                 "prediction_loss_only": True, "report_to": "none", "bf16": True, "seed": 42,
@@ -65,8 +75,13 @@ def main() -> int:
             out.mkdir(parents=True, exist_ok=True)
             config = work / f"{name}.yaml"
             config.write_text(yaml.safe_dump(cfg))
-            with open(work / f"{name}.log", "w") as log:
-                code = subprocess.call(["llamafactory-cli", "train", str(config)], stdout=log, stderr=subprocess.STDOUT, env=env)
+            gpu = free.get()
+            try:
+                with open(work / f"{name}.log", "w") as log:
+                    code = subprocess.call(["llamafactory-cli", "train", str(config)], stdout=log,
+                                           stderr=subprocess.STDOUT, env={**env, "CUDA_VISIBLE_DEVICES": gpu})
+            finally:
+                free.put(gpu)
             if code != 0 or not result.exists():
                 print(f"{name}: failed (exit {code}), see {work / (name + '.log')}", flush=True)
                 return None
@@ -77,7 +92,7 @@ def main() -> int:
     losses: dict[str, float | None] = {"base": run("base", None)}  # also fills the preprocessing cache
     if losses["base"] is None:
         return 1
-    with ThreadPoolExecutor(args.lanes) as pool:
+    with ThreadPoolExecutor(free.qsize()) as pool:
         for ckpt, loss in zip(ckpts, pool.map(lambda c: run(c.name, str(c)), ckpts)):
             losses[ckpt.name] = loss
     for ckpt in ckpts:  # a long sample can OOM when lanes overlap; retry alone
