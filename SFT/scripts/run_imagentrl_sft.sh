@@ -20,7 +20,9 @@ export FORCE_TORCHRUN=${FORCE_TORCHRUN:-0}  # 1 = all visible GPUs via torchrun
 # Credentials (WANDB_API_KEY, …) live outside the synced workspace, mode 600.
 SECRETS=/root/.imagentrl-secrets.env
 if [ -f "$SECRETS" ]; then set -a; . "$SECRETS"; set +a; else echo "WARN: $SECRETS missing"; fi
-if [ -z "${WANDB_API_KEY:-}" ]; then echo "WARN: no WANDB_API_KEY -> wandb offline"; export WANDB_MODE=offline; fi
+# api.wandb.ai answers 403 from AutoDL westd and wandb.init then kills training: log offline,
+# `wandb sync` the run dir later from a machine that can reach wandb.
+export WANDB_MODE=${WANDB_MODE:-offline}
 # wandb's default dir is the cwd (/workspace/SFT) — a mutagen mirror that deletes
 # remote-only files. Keep wandb runs (incl. offline ones for later `wandb sync`) in the run dir.
 export WANDB_DIR=${WANDB_DIR:-$OUTPUT_ROOT}
