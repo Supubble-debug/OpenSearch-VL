@@ -62,6 +62,66 @@ FINAL ANSWER:
 {answer}"""
 
 
+SYSTEM_VISION = (
+    "You audit training trajectories of a multimodal web-search agent. You see the user's question, "
+    "the image(s) attached to the trajectory, the tool calls with their outputs, and the agent's final "
+    "answer. Reply with one JSON object only."
+)
+TASK_VISION = """Judge the FINAL ANSWER. The attached images are, in order: {image_list}.
+
+Tool outputs are often summaries written by another language model: they can invent details or merely \
+repeat the search query. Treat a claim as backed only if the tool output gives concrete source content \
+for it (a page title, a quoted passage, a matching entity), not just the agent's own wording echoed back.
+
+- image_matches: "yes" if the question image is what the trajectory talks about (same object, script, \
+chart, scene), "no" if the trajectory describes something that is not in the image.
+- supported: "yes" if the key claim is backed by the tool outputs or plainly visible in the image; "no" if \
+neither backs it (invented names, numbers, dates; a misread image; a guess the evidence does not confirm); \
+"unclear" only if you truly cannot tell.
+- contradicted: "yes" if the image or the tool outputs contradict the final answer, else "no".
+- granularity_ok: "yes" if it answers exactly what the question asks (right kind of entity and level, \
+e.g. a specific artifact name vs a generic category, genus vs family; a date or year is fine for a \
+"what time/when" question unless an hour is clearly required); "no" otherwise, including refusals.
+
+Return {{"image_matches": "...", "supported": "...", "contradicted": "...", "granularity_ok": "...", "reason": "<= 30 words"}}
+
+QUESTION:
+{question}
+
+TOOL CALLS AND OUTPUTS:
+{evidence}
+
+FINAL ANSWER:
+{answer}"""
+
+
+def encode_images(paths: list[str], max_pixels: int = 512 * 512) -> list[str]:
+    import base64, io
+    from PIL import Image
+    out = []
+    for p in paths:
+        try:
+            im = Image.open(p).convert("RGB")
+        except Exception:  # noqa: BLE001
+            continue
+        w, h = im.size
+        if w * h > max_pixels:
+            f = math.sqrt(max_pixels / (w * h))
+            im = im.resize((max(28, int(w * f)), max(28, int(h * f))))
+        buf = io.BytesIO(); im.save(buf, "JPEG", quality=85)
+        out.append("data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode())
+    return out
+
+
+def pick_images(paths: list[str], n: int) -> tuple[list[str], str]:
+    """Question image first, then the most recent tool-produced images."""
+    if n <= 0 or not paths:
+        return [], ""
+    chosen = paths[:1] + (paths[1:][-(n - 1):] if n > 1 else [])
+    names = ["the question image"] + [f"tool-produced image #{paths.index(p)}" for p in chosen[1:]]
+    return chosen, "; ".join(names)
+
+
 def wilson(k: int, n: int, z: float = 1.96) -> list[float]:
     if n == 0:
         return [0.0, 0.0]
@@ -70,7 +130,7 @@ def wilson(k: int, n: int, z: float = 1.96) -> list[float]:
     return [(c - h) / d, (c + h) / d]
 
 
-def build_prompt(sample: dict, tok, max_tokens: int) -> str | None:
+def build_prompt(sample: dict, tok, max_tokens: int, task: str = TASK, **extra) -> str | None:
     conv = sample["conversations"]
     question = conv[0]["value"].replace("<image>", "[image]").strip()
     final = conv[-1]["value"]
@@ -86,17 +146,19 @@ def build_prompt(sample: dict, tok, max_tokens: int) -> str | None:
             f"[{n}] CALL {c}\nOUTPUT {o[:cap]}{' ...[truncated]' if len(o) > cap else ''}"
             for n, (c, o) in enumerate(steps, 1)
         )
-        prompt = TASK.format(question=question[:3000], evidence=evidence, answer=answer[:3000])
+        prompt = task.format(question=question[:3000], evidence=evidence, answer=answer[:3000], **extra)
         if len(tok(prompt, add_special_tokens=False)["input_ids"]) <= max_tokens:
             return prompt
         cap = int(cap * 0.7)
     return None
 
 
-def judge(api: str, model: str, prompt: str) -> dict:
+def judge(api: str, model: str, prompt: str, images: list[str] | None = None, system: str = SYSTEM) -> dict:
+    content = ([{"type": "image_url", "image_url": {"url": u}} for u in images] + [{"type": "text", "text": prompt}]
+               if images else prompt)
     body = {
         "model": model, "temperature": 0.0, "max_tokens": 200,
-        "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
         "chat_template_kwargs": {"enable_thinking": False},
     }
     last = ""
@@ -121,7 +183,8 @@ def judge(api: str, model: str, prompt: str) -> dict:
 
 
 def is_error(v: dict) -> bool:
-    return v.get("contradicted") == "yes" or v.get("supported") == "no" or v.get("granularity_ok") == "no"
+    return (v.get("contradicted") == "yes" or v.get("supported") == "no" or v.get("granularity_ok") == "no"
+            or v.get("image_matches") == "no")
 
 
 def main() -> int:
@@ -138,6 +201,9 @@ def main() -> int:
     ap.add_argument("--model", default="summariser")
     ap.add_argument("--max-prompt-tokens", type=int, default=14500)
     ap.add_argument("--workers", type=int, default=48)
+    ap.add_argument("--images", type=int, default=0,
+                    help="attach up to N trajectory images (question image + latest tool images); "
+                         "the server must accept images (SUMMARY_MAX_IMAGES>=N)")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -145,8 +211,9 @@ def main() -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    data = {}
+    data, src_dirs = {}, {}
     for src, fname in sel.SOURCES.items():
+        src_dirs[src] = Path(args.data_root) / src
         for idx, s in enumerate(json.load(open(Path(args.data_root) / src / fname, encoding="utf-8"))):
             data[f"{src}:{idx}"] = s
 
@@ -180,8 +247,19 @@ def main() -> int:
     print(f"[judge] {len(todo)} to judge ({len(done)} already done)", flush=True)
 
     def work(sid: str) -> dict:
-        prompt = build_prompt(data[sid], tok, args.max_prompt_tokens)
-        v = judge(args.api, args.model, prompt) if prompt else {"judge_failed": "prompt too long"}
+        if args.images:
+            d = src_dirs[sid.split(":")[0]]
+            paths = [p if os.path.isabs(p) else str(d / p) for p in data[sid].get("images") or []]
+            chosen, names = pick_images(paths, args.images)
+            imgs = encode_images(chosen)
+            # 512x512 at 32 px per merged token = 256 tokens per image (+ markers)
+            prompt = build_prompt(data[sid], tok, args.max_prompt_tokens - 300 * len(imgs), task=TASK_VISION,
+                                  image_list=names or "none")
+            v = (judge(args.api, args.model, prompt, imgs, SYSTEM_VISION) if prompt
+                 else {"judge_failed": "prompt too long"})
+        else:
+            prompt = build_prompt(data[sid], tok, args.max_prompt_tokens)
+            v = judge(args.api, args.model, prompt) if prompt else {"judge_failed": "prompt too long"}
         return {"id": sid, "cat": cats.get(sid), "source": sid.split(":")[0], **v}
 
     t0 = time.time()
