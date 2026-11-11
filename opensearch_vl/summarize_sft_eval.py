@@ -33,9 +33,10 @@ def sign_test_p(b: int, c: int) -> float:
     return min(1.0, 2 * tail)
 
 
-def load_run(path: Path) -> dict[str, dict]:
+def load_run(path: Path, report: str | None = None) -> dict[str, dict]:
     judged = {}
-    for details in path.glob("eval_report_*_details.jsonl"):
+    pattern = f"eval_report_{report}_details.jsonl" if report else "eval_report_*_details.jsonl"
+    for details in path.glob(pattern):
         for line in open(details, encoding="utf-8"):
             r = json.loads(line)
             judged[r["case_id"]] = r
@@ -100,9 +101,11 @@ def main() -> None:
     ap.add_argument("--run", action="append", required=True, help="tag=dir")
     ap.add_argument("--baseline", action="append", default=[])
     ap.add_argument("--out", required=True)
+    ap.add_argument("--report", default=None,
+                    help="judge report name to read (eval_report_<report>_details.jsonl); default: all")
     args = ap.parse_args()
 
-    runs = {tag: load_run(Path(p)) for tag, p in (r.split("=", 1) for r in args.run)}
+    runs = {tag: load_run(Path(p), args.report) for tag, p in (r.split("=", 1) for r in args.run)}
     report: dict = {"overall": {}, "by_bench": {}, "paired": {}}
     benches = sorted({c["bench"] for cases in runs.values() for c in cases.values()})
     for tag, cases in runs.items():
