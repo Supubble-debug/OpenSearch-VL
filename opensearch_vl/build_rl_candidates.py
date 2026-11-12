@@ -138,6 +138,8 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--exclude-ids", nargs="*", default=[],
                     help="parquet(s) or text file(s) of data_ids already sampled; they are not drawn again")
+    ap.add_argument("--skip-sources", nargs="*", default=[],
+                    help="RL-8K sources not to sample (e.g. palace: AI references invent catalogue names)")
     ap.add_argument("--n", type=int, default=800)
     ap.add_argument("--demo-quota", type=int, default=320)
     ap.add_argument("--seed", type=int, default=20261110)
@@ -220,7 +222,7 @@ def main() -> None:
 
     rng = random.Random(args.seed)
     quota = {"demo_1k": min(args.demo_quota, len(pools.get("demo_1k", [])))}
-    others = [s for s in pools if s != "demo_1k"]
+    others = [s for s in pools if s != "demo_1k" and s not in args.skip_sources]
     rest = args.n - quota["demo_1k"]
     w = {s: math.sqrt(len(pools[s])) for s in others}
     for s in others:
