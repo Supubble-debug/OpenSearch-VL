@@ -967,6 +967,8 @@ class Qwen35VLLMRunner(Qwen35SFTRunner):
         self.url = (url or os.environ.get("VLLM_TOKEN_URL") or "http://127.0.0.1:8001").rstrip("/")
         self.top_p = float(os.environ.get("SAMPLING_TOP_P", "1.0"))
         self.top_k = int(os.environ.get("SAMPLING_TOP_K", "-1"))
+        # RL: path of the current policy LoRA (server started with --enable-lora); None = base.
+        self.lora_path: Optional[str] = os.environ.get("VLLM_LORA_PATH") or None
 
     @property
     def display_name(self) -> str:
@@ -1012,6 +1014,8 @@ class Qwen35VLLMRunner(Qwen35SFTRunner):
             "top_k": self.top_k if cfg.temperature > 0 else -1,
             "stop_token_ids": self._eos_ids,
         }
+        if self.lora_path:
+            body["lora_path"] = self.lora_path
         last: Optional[Exception] = None
         for attempt in range(4):
             try:

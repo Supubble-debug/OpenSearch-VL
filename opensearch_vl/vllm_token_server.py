@@ -11,7 +11,7 @@ returned so the parity test can check that.
     /root/venvs/vllm/bin/python vllm_token_server.py --model /root/models/qwen3vl4b-sft-merged \
         --port 8001 --gpu 0
 
-POST /generate {"prompt_token_ids": [...], "images": ["<base64 png>", ...],
+POST /generate {"prompt_token_ids": [...], "images": ["<base64 png>", ...], "lora_path": null,
                 "max_tokens": 4096, "temperature": 1.0, "top_p": 1.0, "top_k": -1,
                 "stop_token_ids": [...], "seed": null}
   -> {"text", "token_ids", "finish_reason", "prompt_token_ids"}
@@ -35,6 +35,8 @@ def main() -> None:
     ap.add_argument("--max-model-len", type=int, default=40960)
     ap.add_argument("--max-images", type=int, default=24)
     ap.add_argument("--max-num-seqs", type=int, default=64)
+    ap.add_argument("--enable-lora", action="store_true", help="serve per-request LoRA adapters (RL)")
+    ap.add_argument("--max-lora-rank", type=int, default=32)
     args = ap.parse_args()
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", args.gpu)
 
@@ -61,8 +63,11 @@ def main() -> None:
             max_num_seqs=args.max_num_seqs,
             limit_mm_per_prompt={"image": args.max_images, "video": 0},
             enable_prefix_caching=True,
+            **(dict(enable_lora=True, max_lora_rank=args.max_lora_rank, max_loras=2, max_cpu_loras=4)
+               if args.enable_lora else {}),
         )
     )
+    lora_ids: dict[str, int] = {}
     app = FastAPI()
 
     def collapse(ids: list[int]) -> list[int]:
@@ -95,8 +100,15 @@ def main() -> None:
             skip_special_tokens=True,
             spaces_between_special_tokens=False,
         )
+        lora = None
+        if req.get("lora_path"):
+            from vllm.lora.request import LoRARequest
+
+            path = req["lora_path"]
+            lid = lora_ids.setdefault(path, len(lora_ids) + 1)
+            lora = LoRARequest(f"lora{lid}", lid, path)
         final = None
-        async for out in engine.generate(prompt, params, request_id=uuid.uuid4().hex):
+        async for out in engine.generate(prompt, params, request_id=uuid.uuid4().hex, lora_request=lora):
             final = out
         c = final.outputs[0]
         return {

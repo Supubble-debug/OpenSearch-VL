@@ -204,8 +204,15 @@ def process_single_case(
     dataset_type: str = "train",
     visual_lookup: Optional[Callable[..., object]] = None,
     inference_cfg: Optional[InferenceConfig] = None,
+    fatal_consecutive_errors: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Drive one benchmark example through the agent."""
+    """Drive one benchmark example through the agent.
+
+    ``fatal_consecutive_errors=K`` (RL, OpenSearch-VL fatal-aware GRPO) stops the
+    rollout with ``stop_reason="fatal"`` once K tool calls in a row return a
+    tool-execution error; ``trajectory["fatal_turn"]`` is the turn of the K-th.
+    The returned dict also carries the final ``contents`` (not written to disk).
+    """
 
     filename_prefix = "fvqa_test" if dataset_type == "test" else "fvqa_train"
 
@@ -268,6 +275,7 @@ def process_single_case(
 
     intermediate_dir = os.path.join(output_dir, "intermediate")
     cfg = inference_cfg or InferenceConfig()
+    consecutive_errors = 0
 
     for turn_num in range(config.MAX_TURNS):
         try:
@@ -346,6 +354,14 @@ def process_single_case(
         turn_record["tool_call"] = tool_call_json
         observation_text = f"<observation>\n{tool_message}\n</observation>"
         turn_record["tool_output"] = observation_text
+        tool_error = str(tool_message).lstrip().startswith("Tool execution error")
+        turn_record["tool_error"] = tool_error
+        consecutive_errors = consecutive_errors + 1 if tool_error else 0
+        if fatal_consecutive_errors and consecutive_errors >= fatal_consecutive_errors:
+            trajectory["stop_reason"] = "fatal"
+            trajectory["fatal_turn"] = turn_num
+            gemini_contents.append({"role": "user", "parts": [{"text": observation_text}]})
+            break
 
         if new_images:
             for new_id, payload in new_images.items():
@@ -434,4 +450,5 @@ def process_single_case(
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(serialised, fh, ensure_ascii=False, indent=2)
     logger.info("Trajectory saved to %s", out_path)
+    trajectory["contents"] = gemini_contents
     return trajectory
