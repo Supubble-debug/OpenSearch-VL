@@ -136,6 +136,8 @@ def main() -> None:
     ap.add_argument("--sft-root", default=None, help="Search-VL-SFT-36K dir (json files; images optional)")
     ap.add_argument("--sft-images", action="store_true", help="also pHash SFT images (needs extracted images)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--exclude-ids", nargs="*", default=[],
+                    help="parquet(s) or text file(s) of data_ids already sampled; they are not drawn again")
     ap.add_argument("--n", type=int, default=800)
     ap.add_argument("--demo-quota", type=int, default=320)
     ap.add_argument("--seed", type=int, default=20261110)
@@ -168,6 +170,15 @@ def main() -> None:
         recs.append({"rid": f"rl8k_{i:05d}", "src": r["dataset"], "q": r["question"], "qnorm": qn, "phash": ph,
                      "answer": r["answer"], "images": [str(root / p) for p in r["images"]]})
     print(f"[load] {len(rows)} rows, {len(recs)} after dedup", flush=True)
+    if args.exclude_ids:
+        import pandas as pd
+        seen_ids = set()
+        for p in args.exclude_ids:
+            seen_ids |= (set(pd.read_parquet(p, columns=["data_id"]).data_id) if p.endswith(".parquet")
+                         else set(open(p).read().split()))
+        reasons["already_sampled"] += sum(r["rid"] in seen_ids for r in recs)
+        recs = [r for r in recs if r["rid"] not in seen_ids]
+        print(f"[exclude] {len(seen_ids)} ids already sampled, {len(recs)} remain", flush=True)
 
     indexes = []
     if args.eval:
