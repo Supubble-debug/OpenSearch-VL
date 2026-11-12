@@ -395,7 +395,7 @@ if __name__ == "__main__":
     parser.add_argument("--traj_dir", type=str, required=True,
                         help="Directory containing trajectory JSON files")
     parser.add_argument("--benchmark", type=str, required=True,
-                        choices=["hle", "bc_vl", "vdr"],
+                        # any name: only "hle" changes answer handling; the name labels the report file
                         help="Benchmark type: hle, bc_vl, or vdr")
     parser.add_argument("--max_workers", type=int, default=20,
                         help="Number of parallel workers")
