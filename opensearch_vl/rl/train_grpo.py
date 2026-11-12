@@ -131,7 +131,8 @@ class Roller:
         stop = traj.get("stop_reason", "")
         turns = traj.get("turns", [])
         fatal_turn = traj.get("fatal_turn")
-        aliases = list(row.get("aliases") or [])
+        raw = row.get("aliases")
+        aliases = [] if raw is None else [str(x) for x in list(raw)]  # parquet gives a numpy array
         gold = str(row["answer"])
         fmt = R.format_score(turns, stop, fatal_turn)
         acc, judge_failed = 0, False
