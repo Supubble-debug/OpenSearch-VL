@@ -82,6 +82,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--logit-chunk", type=int, default=2048)
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--keep-adapters", type=int, default=3, help="keep the last N step adapters (+ every 5th)")
+    ap.add_argument("--min-balance", type=float, default=10.0,
+                    help="DeepSeek credit (CNY) below which the run stops before the next step")
+    ap.add_argument("--max-judge-fail-rate", type=float, default=0.25,
+                    help="stop if more than this share of rollouts had an unanswered judge call")
     ap.add_argument("--seed", type=int, default=20261113)
     return ap.parse_args()
 
@@ -100,6 +104,20 @@ class Metrics:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         log.info("step %d %s", step, json.dumps({k: (round(v, 4) if isinstance(v, float) else v)
                                                   for k, v in values.items()}, ensure_ascii=False))
+
+
+class BudgetExhausted(RuntimeError):
+    """Paid API budget or quota is (nearly) gone: stop before burning more rollouts."""
+
+
+def deepseek_balance() -> float:
+    """Remaining DeepSeek credit in CNY (the same key pays for text search and the judge)."""
+    import requests
+
+    r = requests.get("https://api.deepseek.com/user/balance", timeout=30,
+                     headers={"Authorization": f"Bearer {os.environ['DEEPSEEK_API_KEY']}"})
+    r.raise_for_status()
+    return float(sum(float(b["total_balance"]) for b in r.json()["balance_infos"]))
 
 
 def mean(xs: List[float]) -> float:
@@ -381,6 +399,14 @@ def main() -> int:
         if args.max_steps and step > args.max_steps:
             break
         t0 = time.time()
+        try:
+            balance = deepseek_balance()
+        except Exception as exc:  # balance API hiccup must not kill training
+            log.warning("balance check failed: %s", exc)
+            balance = float("nan")
+        if balance == balance and balance < args.min_balance:
+            print(f"RL_STOPPED: DeepSeek balance {balance:.2f} < --min-balance {args.min_balance}", flush=True)
+            raise BudgetExhausted(f"DeepSeek balance {balance:.2f}")
         rows = next_rows(args.prompts_per_step)
         if not rows:
             break
@@ -406,6 +432,13 @@ def main() -> int:
             for r, a in zip(g, adv):
                 samples.append({**r, "adv": a})
         info = summarize(groups, "rollout")
+        info["deepseek_balance"] = balance
+        flat = [r for g in groups.values() for r in g]
+        fail_rate = (sum(r["judge_failed"] for r in flat) / len(flat)) if flat else 0.0
+        if fail_rate > args.max_judge_fail_rate:
+            print(f"RL_STOPPED: judge unanswered on {fail_rate:.0%} of rollouts (balance {balance:.2f})", flush=True)
+            json.dump(state, open(state_path, "w"))
+            raise BudgetExhausted(f"judge failed on {fail_rate:.0%} of rollouts")
         info.update({"groups/total": len(groups), "groups/kept": len(kept), "groups/extra_prompts": extra,
                      "time/rollout_min": t_roll / 60, "epoch_progress": consumed / max(1, total_q)})
         if samples:
@@ -430,4 +463,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except BudgetExhausted as exc:  # clean, loud stop: the patrol reports RL_STOPPED
+        log.error("stopping: %s", exc)
+        raise SystemExit(3)
