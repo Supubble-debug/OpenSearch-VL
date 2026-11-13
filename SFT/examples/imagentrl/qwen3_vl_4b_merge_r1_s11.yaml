@@ -1,0 +1,10 @@
+# Merge RL r1 step-11 LoRA (trained on top of SFT v2 merged) into a servable model.
+model_name_or_path: /root/models/qwen3vl4b-sft-v2-merged
+adapter_name_or_path: /root/rl_runs/r1/adapters/step_0011
+template: qwen3_vl
+finetuning_type: lora
+trust_remote_code: true
+export_dir: /root/models/qwen3vl4b-rl-r1-s11-merged
+export_size: 5
+export_device: cpu
+export_legacy_format: false
