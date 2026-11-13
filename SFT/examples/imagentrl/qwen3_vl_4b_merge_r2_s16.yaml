@@ -1,0 +1,10 @@
+# Merge RL r2 step-16 LoRA (temperature-aligned trainer, original reward) into a servable model.
+model_name_or_path: /root/models/qwen3vl4b-sft-v2-merged
+adapter_name_or_path: /root/rl_runs/r2/adapters/step_0016
+template: qwen3_vl
+finetuning_type: lora
+trust_remote_code: true
+export_dir: /root/models/qwen3vl4b-rl-r2-s16-merged
+export_size: 5
+export_device: cpu
+export_legacy_format: false
