@@ -37,6 +37,7 @@ def main() -> None:
     ap.add_argument("--max-num-seqs", type=int, default=64)
     ap.add_argument("--enable-lora", action="store_true", help="serve per-request LoRA adapters (RL)")
     ap.add_argument("--max-lora-rank", type=int, default=32)
+    ap.add_argument("--seed", type=int, default=0, help="engine sampling seed (distinct per server for independent samples)")
     args = ap.parse_args()
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", args.gpu)
 
@@ -63,6 +64,7 @@ def main() -> None:
             max_num_seqs=args.max_num_seqs,
             limit_mm_per_prompt={"image": args.max_images, "video": 0},
             enable_prefix_caching=True,
+            seed=args.seed,
             **(dict(enable_lora=True, max_lora_rank=args.max_lora_rank, max_loras=2, max_cpu_loras=4)
                if args.enable_lora else {}),
         )

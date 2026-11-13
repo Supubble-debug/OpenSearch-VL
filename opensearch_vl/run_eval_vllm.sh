@@ -14,6 +14,9 @@ SFT_ENV=/root/miniconda3/envs/sft; VLLM_PY=/root/venvs/vllm/bin/python
 export PATH="$SFT_ENV/bin:/root/miniconda3/bin:$PATH"
 export TOKENIZERS_PARALLELISM=false AGENT_MAX_TURNS=${AGENT_MAX_TURNS:-15}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-4096}; WORKERS=${WORKERS:-8}
+# TEMPERATURE>0 = sampled eval (top_p 1, top_k off, as in RL); each server gets seed SEED_BASE+i, so
+# tags sharing a model (e.g. v2s0=/m v2s1=/m) are independent samples.
+TEMPERATURE=${TEMPERATURE:-0}; SEED_BASE=${SEED_BASE:-1000}
 SECRETS=/root/.imagentrl-secrets.env
 [ -f "$SECRETS" ] || { echo "ERROR: $SECRETS missing"; exit 1; }
 set -a; . "$SECRETS"; set +a
@@ -52,7 +55,7 @@ for spec in "$@"; do
   [ -z "$lora" ] || [ -f "$lora/adapter_config.json" ] || { echo "ERROR: $lora is not a LoRA dir"; exit 1; }
   TAGS+=("$tag"); MODELS+=("$model"); PORTS+=("$port"); LORAS+=("$lora")
   CUDA_VISIBLE_DEVICES=0 "$VLLM_PY" "$HERE/vllm_token_server.py" --model "$model" --port "$port" \
-    --gpu-memory-utilization "$MEM" --max-num-seqs 32 ${lora:+--enable-lora --max-lora-rank 32} \
+    --gpu-memory-utilization "$MEM" --max-num-seqs 32 --seed $((SEED_BASE + i)) ${lora:+--enable-lora --max-lora-rank 32} \
     > "$OUTPUT_ROOT/vllm_policy_$tag.log" 2>&1 &
   PIDS+=($!); i=$((i + 1))
   sleep 60  # stagger engine start-up (memory profiling) on the shared GPU
@@ -72,7 +75,7 @@ for j in "${!TAGS[@]}"; do
   tag=${TAGS[$j]}; mkdir -p "$WORK/$tag"
   VLLM_TOKEN_URL=http://127.0.0.1:${PORTS[$j]} VLLM_LORA_PATH=${LORAS[$j]} python "$HERE/run_infer.py" --model qwen3-vl-4b-vllm \
     --checkpoint "${MODELS[$j]}" --dataset test --data-path "$CASES" --output-dir "$WORK/$tag" --skip-existing \
-    --workers "$WORKERS" --temperature 0 --max-tokens "$MAX_NEW_TOKENS" --log-level WARNING \
+    --workers "$WORKERS" --temperature "$TEMPERATURE" --max-tokens "$MAX_NEW_TOKENS" --log-level WARNING \
     > "$OUTPUT_ROOT/infer_$tag.log" 2>&1 &
   pids+=($!)
 done
