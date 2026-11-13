@@ -22,6 +22,13 @@ import unicodedata
 from typing import Any, Dict, List, Optional
 
 W_ACC, W_QUERY = 0.8, 0.2
+
+
+def set_weights(w_acc: float, w_query: float) -> None:
+    """Reward weights as a run-level setting (the ablation in 2026-11-13 needs 1.0 / 0.0)."""
+    global W_ACC, W_QUERY
+    assert abs(w_acc + w_query - 1.0) < 1e-9, "weights must sum to 1"
+    W_ACC, W_QUERY = float(w_acc), float(w_query)
 SEARCH_TOOLS = {"text_search", "image_search", "web_search", "search", "layout_parsing"}
 _THINK = re.compile(r"^\s*<think>.*?</think>(.*)$", re.S)
 _CALL = re.compile(r"<tool_call>\s*(\{.*\})\s*</tool_call>\s*$", re.S)

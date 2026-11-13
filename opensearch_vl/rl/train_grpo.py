@@ -82,6 +82,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--logit-chunk", type=int, default=2048)
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--keep-adapters", type=int, default=3, help="keep the last N step adapters (+ every 5th)")
+    ap.add_argument("--w-acc", type=float, default=0.8)
+    ap.add_argument("--w-query", type=float, default=0.2)
     ap.add_argument("--min-balance", type=float, default=10.0,
                     help="DeepSeek credit (CNY) below which the run stops before the next step")
     ap.add_argument("--max-judge-fail-rate", type=float, default=0.25,
@@ -364,6 +366,8 @@ def main() -> int:
         dev = dev.head(args.dev_limit)
     log.info("train %d q, dev %d q", len(train), 0 if dev is None else len(dev))
 
+    R.set_weights(args.w_acc, args.w_query)
+    log.info("reward weights acc=%.2f query=%.2f", R.W_ACC, R.W_QUERY)
     roller = Roller(args)
     policy = Policy(args, roller)
     metrics = Metrics(args.metrics)
@@ -443,6 +447,13 @@ def main() -> int:
                 samples.append({**r, "adv": a})
         info = summarize(groups, "rollout")
         info["deepseek_balance"] = balance
+        skipped_by_stop = collections.Counter(s["stop"] for s in samples if s["adv"] == 0.0)
+        info.update({
+            "train/adv_pos": sum(1 for s in samples if s["adv"] > 0),
+            "train/adv_neg": sum(1 for s in samples if s["adv"] < 0),
+            "train/adv_zero_by_stop": dict(skipped_by_stop),
+            "train/fatal_in_samples": sum(1 for s in samples if s["fatal"]),
+        })
         flat = [r for g in groups.values() for r in g]
         fail_rate = (sum(r["judge_failed"] for r in flat) / len(flat)) if flat else 0.0
         if fail_rate > args.max_judge_fail_rate:
