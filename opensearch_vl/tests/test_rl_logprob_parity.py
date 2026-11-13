@@ -4,9 +4,12 @@
 The RL update computes log-probs of the sampled tokens in HF. For that gradient to be the
 gradient of the *sampling* policy, three things must hold:
 
-1. temperature — the rollouts sample with p ∝ exp(logits / T); HF must use
-   log_softmax(logits / T). This prints the gap between T and T=1 so the fix is measured,
-   not assumed.
+1. model identity — vLLM 0.33 returns the *raw* log-probs (pre-temperature: see
+   "Use the original logits (before any penalties or temperature scaling)" in
+   vllm/v1/sample/sampler.py), so HF with T=1 must match them; a large gap means HF and
+   vLLM disagree about the model. The sampling distribution itself is p ∝ exp(logits / T)
+   (top_p=1, top_k off), so the RL update must use log_softmax(logits / T) — that is a
+   separate, code-level fix, and its size is printed as the T column for information.
 2. token identity — the trainer re-renders each assistant turn from its *text*; if that
    re-tokenisation differs from the ids vLLM actually generated, the update is computed on
    a different sequence. Compares the generated ids with the ids obtained by re-tokenising
