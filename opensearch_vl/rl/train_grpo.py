@@ -9,8 +9,12 @@ Per step: draw --prompts-per-step questions, --n rollouts each; score (rl/reward
 groups whose rewards are all equal (no signal) and draw more questions until enough groups
 have signal (dynamic sampling, at most --max-extra-prompts extra); RLOO advantages with
 fatal clamping (A >= 0 for trajectories stopped by K consecutive tool errors, post-fatal
-tokens masked); one on-policy update (ratio = 1, so the objective is -A * mean token
-log-prob per sequence, averaged over sequences); save the LoRA; vLLM picks it up by path.
+tokens masked); PPO-clip update over --ppo-epochs x --minibatches optimizer steps (the first
+minibatch is on-policy, ratio = 1); token-level loss summed and divided by a constant
+(--loss-norm-tokens per sequence; no per-sequence length normalisation, which down-weights
+every token of long trajectories); save the LoRA; vLLM picks it up by path. An optional fp32
+KL probe (rl/kl_probe.py) measures the drift from the SFT policy every step and stops the
+run past --kl-stop.
 
 Training sequences are rendered with LLaMA-Factory's template exactly as in SFT
 (Qwen35SFTRunner prompt stack); only assistant turns before the fatal step are trained.
@@ -64,7 +68,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-extra-prompts", type=int, default=8)
     ap.add_argument("--epochs", type=float, default=1.0)
     ap.add_argument("--max-steps", type=int, default=0)
-    ap.add_argument("--lr", type=float, default=1e-5)
+    ap.add_argument("--lr", type=float, default=3e-5)
+    ap.add_argument("--ppo-epochs", type=int, default=1, help="passes over each step's samples")
+    ap.add_argument("--minibatches", type=int, default=2, help="optimizer steps per pass")
+    ap.add_argument("--clip-eps", type=float, default=0.2)
+    ap.add_argument("--loss-norm-tokens", type=float, default=1024.0,
+                    help="loss = -sum_tokens(surrogate) / (seqs_in_minibatch * this)")
+    ap.add_argument("--kl-probe-rollouts", nargs="*", default=None,
+                    help="dirs of reference rollouts (s*/<id>_trajectory.json) sampled by the SFT policy")
+    ap.add_argument("--kl-probe-n", type=int, default=8)
+    ap.add_argument("--kl-probe-max-len", type=int, default=8000)
+    ap.add_argument("--kl-stop", type=float, default=0.05,
+                    help="stop (clean, final dev eval) when fp32 per-token KL vs SFT exceeds this; 0 = never")
     ap.add_argument("--lora-r", type=int, default=32)
     ap.add_argument("--lora-alpha", type=int, default=64)
     ap.add_argument("--temperature", type=float, default=0.7)
@@ -227,6 +242,9 @@ class Policy:
         log.info("trainable params %.1fM in %d tensors", n_train / 1e6, len(names))
         self.model = model
         self.inner = model.base_model.model  # Qwen3VLForConditionalGeneration
+        self.rng = random.Random(args.seed)
+        self.lora_config = LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
+                                      target_modules=LORA_TARGETS, bias="none")
         self.opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr,
                                      betas=(0.9, 0.999), weight_decay=0.0)
         opt_path = os.path.join(resume, "optimizer.pt")
@@ -288,40 +306,75 @@ class Policy:
         return torch.cat([checkpoint(chunk, hs[i:i + c], ys[i:i + c], use_reentrant=False)
                           for i in range(0, len(ys), c)])
 
-    def update(self, samples: List[Dict[str, Any]], n_total: int) -> Dict[str, Any]:
-        """One on-policy step: loss = sum_i -A_i * mean_t logp_it / n_total."""
+    def update(self, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """PPO-clip over this step's samples.
+
+        old log-probs come from a no-grad pass before any optimizer step, so the first minibatch
+        is exactly on-policy (ratio = 1) and later ones are importance-weighted and clipped.
+        Per minibatch: loss = -sum_{seq, token} min(r*A, clip(r)*A) / (n_seq * loss_norm_tokens).
+        """
         torch = self.torch
+        args = self.args
+        work = [s for s in samples if s["adv"] != 0.0]
+        old, skipped = {}, 0
         self.model.train()
-        self.opt.zero_grad(set_to_none=True)
-        skipped, tokens, logps = 0, 0, []
-        for s in samples:
-            if s["adv"] == 0.0:
-                continue
-            enc = self.encode(s["contents"], s["fatal_turn"])
-            if enc is None:
-                skipped += 1
-                continue
-            ids, mask, mm = enc
-            try:
-                lp = self.token_logp(ids, mask, mm)
-                loss = -(s["adv"] * lp.mean()) / n_total
-                loss.backward()
-            except torch.cuda.OutOfMemoryError:
-                log.warning("OOM on a %d-token sequence, skipped", ids.shape[1])
-                torch.cuda.empty_cache()
-                skipped += 1
-                continue
-            tokens += int(mask.sum())
-            logps.append(float(lp.detach().mean()))
-            del ids, mask, mm, lp, loss
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        gnorm = float(torch.nn.utils.clip_grad_norm_(params, self.args.grad_clip))
-        if math.isfinite(gnorm):
-            self.opt.step()
+        with torch.no_grad():
+            for i, s in enumerate(work):
+                enc = self.encode(s["contents"], s["fatal_turn"])
+                if enc is None:
+                    skipped += 1
+                    continue
+                try:
+                    old[i] = self.token_logp(*enc).detach().float().cpu()
+                except torch.cuda.OutOfMemoryError:
+                    log.warning("OOM on a %d-token sequence (old logp), skipped", enc[0].shape[1])
+                    torch.cuda.empty_cache()
+                    skipped += 1
+                del enc
+        idx = list(old)
+        tokens = int(sum(len(old[i]) for i in idx))
+        gnorms, clipfr, kl_approx, n_opt = [], [], [], 0
+        for _ in range(args.ppo_epochs):
+            self.rng.shuffle(idx)
+            k = max(1, math.ceil(len(idx) / max(1, args.minibatches)))
+            for mb in (idx[j:j + k] for j in range(0, len(idx), k)):
+                self.opt.zero_grad(set_to_none=True)
+                done = 0
+                for i in mb:
+                    s = work[i]
+                    ids, mask, mm = self.encode(s["contents"], s["fatal_turn"])
+                    try:
+                        lp = self.token_logp(ids, mask, mm)
+                        lp_old = old[i].to(lp.device)
+                        assert lp.shape == lp_old.shape, "re-encoding changed the token count"
+                        ratio = torch.exp(lp - lp_old)
+                        adv = float(s["adv"])
+                        surr = torch.minimum(ratio * adv, ratio.clamp(1 - args.clip_eps, 1 + args.clip_eps) * adv)
+                        loss = -surr.sum() / (len(mb) * args.loss_norm_tokens)
+                        loss.backward()
+                    except torch.cuda.OutOfMemoryError:
+                        log.warning("OOM on a %d-token sequence, skipped", ids.shape[1])
+                        torch.cuda.empty_cache()
+                        continue
+                    with torch.no_grad():
+                        clipfr.append(float(((ratio - 1).abs() > args.clip_eps).float().mean()))
+                        kl_approx.append(float((lp_old - lp).mean()))
+                    done += 1
+                    del ids, mask, mm, lp, lp_old, ratio, surr, loss
+                if not done:
+                    continue
+                params = [p for p in self.model.parameters() if p.requires_grad]
+                gnorm = float(torch.nn.utils.clip_grad_norm_(params, args.grad_clip))
+                gnorms.append(gnorm)
+                if math.isfinite(gnorm):
+                    self.opt.step()
+                    n_opt += 1
         self.opt.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
-        return {"train/seqs": len(logps), "train/skipped": skipped, "train/tokens": tokens,
-                "train/grad_norm": gnorm, "train/mean_logp": mean(logps),
+        return {"train/seqs": len(idx), "train/skipped": skipped, "train/tokens": tokens,
+                "train/opt_steps": n_opt, "train/grad_norm": mean(gnorms), "train/grad_norm_max": max(gnorms or [0.0]),
+                "train/mean_logp": mean([float(old[i].mean()) for i in idx]),
+                "train/clip_frac": mean(clipfr), "train/approx_kl_bf16": mean(kl_approx),
                 "train/max_mem_gb": torch.cuda.max_memory_allocated() / 2**30}
 
     def save(self, step: int) -> str:
@@ -371,6 +424,13 @@ def main() -> int:
     roller = Roller(args)
     policy = Policy(args, roller)
     metrics = Metrics(args.metrics)
+    probe = None
+    if args.kl_probe_rollouts and args.kl_probe_n > 0:
+        from rl.kl_probe import KLProbe, load_reference_trajectories
+
+        refs = load_reference_trajectories(args.kl_probe_rollouts, [args.train], args.kl_probe_n, args.seed)
+        probe = KLProbe(args.model, roller.runner, policy.lora_config, refs, args.temperature, args.kl_probe_max_len)
+        log.info("fp32 KL probe: %d reference trajectories", len(probe.items))
 
     state_path = os.path.join(args.run_dir, "state.json")
     state = json.load(open(state_path)) if os.path.exists(state_path) else {"step": 0, "epoch": 0, "pos": 0, "order": []}
@@ -464,8 +524,15 @@ def main() -> int:
                      "time/rollout_min": t_roll / 60, "epoch_progress": consumed / max(1, total_q)})
         if samples:
             t1 = time.time()
-            info.update(policy.update(samples, n_total=len(samples)))
+            info.update(policy.update(samples))
             info["time/train_min"] = (time.time() - t1) / 60
+        kl_hit = False
+        if probe is not None:
+            t2 = time.time()
+            info.update(probe.measure(policy.model) or {})
+            info["time/kl_probe_min"] = (time.time() - t2) / 60
+            kl = info.get("kl_probe/kl_per_token")
+            kl_hit = bool(args.kl_stop and kl is not None and kl > args.kl_stop)
         path = policy.save(step)
         roller.runner.lora_path = os.path.realpath(path)
         prune_adapters(args.run_dir, args.keep_adapters, step)
@@ -474,6 +541,9 @@ def main() -> int:
         metrics.write(step, info)
         if args.eval_every and step % args.eval_every == 0:
             evaluate(step)
+        if kl_hit:
+            print(f"RL_KL_STOP: fp32 KL {info['kl_probe/kl_per_token']:.4g} > --kl-stop {args.kl_stop}", flush=True)
+            break
     if dev is not None and (not args.eval_every or state["step"] % args.eval_every):
         evaluate(state["step"])
     final = os.path.join(args.run_dir, "adapters", "final")
