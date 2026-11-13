@@ -5,6 +5,8 @@
 # DeepSeek: text search + strict judge; Doubao: image search.
 #   bash opensearch_vl/run_rl.sh <run_name> [extra train_grpo.py args...]
 # Env: RL_MODEL, RL_TRAIN, RL_DEV, VLLM_MEM (0.40), MIN_DEEPSEEK_CNY (30). Re-running resumes.
+# RL_ENTRY: another script taking the same --model/--train/--dev/--run-dir/--metrics/--max-turns
+# (e.g. rl/seen_unseen_check.py) run against the same services.
 set -uo pipefail
 NAME=${1:?run name}; shift
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -55,7 +57,7 @@ case "$QWEN_API_BASE" in http://127.0.0.1*) ;; *) echo "ERROR: summariser must b
 echo "[$(date +%T)] services ready"
 
 cd "$HERE"
-CUDA_VISIBLE_DEVICES=0 python rl/train_grpo.py --model "$MODEL" --train "$TRAIN" --dev "$DEV" \
+CUDA_VISIBLE_DEVICES=0 python "${RL_ENTRY:-rl/train_grpo.py}" --model "$MODEL" --train "$TRAIN" --dev "$DEV" \
   --run-dir "$RUN" --metrics "$OUTPUT_ROOT/metrics.jsonl" --max-turns "$AGENT_MAX_TURNS" "$@"
 rc=$?
 mkdir -p "$OUTPUT_ROOT/adapter"
