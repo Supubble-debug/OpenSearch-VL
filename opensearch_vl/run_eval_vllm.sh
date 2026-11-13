@@ -3,6 +3,8 @@
 # one policy server per model on GPU 0, local 27B summariser on GPU 1 (reused if already up on
 # :8000), DeepSeek judge in lenient ("vdr") and strict ("vdr_strict") mode. Greedy decoding.
 #   bash opensearch_vl/run_eval_vllm.sh <cases.parquet> <work_dir> tag1=/merged/model1 [tag2=/merged/model2 ...]
+# A spec tag=/model+/lora_dir serves the RL LoRA unmerged (vLLM --enable-lora, per-request adapter):
+# the policy exactly as trained, without bf16 merge rounding.
 # Re-running resumes (finished trajectories are skipped; search results come from the shared cache).
 set -uo pipefail
 CASES=${1:?cases parquet}; WORK=${2:?work dir}; shift 2
@@ -40,15 +42,18 @@ if ! curl -s -m 5 -o /dev/null http://127.0.0.1:8080/docs; then
 fi
 up http://127.0.0.1:8000/v1/models || { bash "$HERE/start_summary_service.sh" > "$OUTPUT_ROOT/summary_service.log" 2>&1 & PIDS+=($!); }
 
-TAGS=(); MODELS=(); PORTS=()
+TAGS=(); MODELS=(); PORTS=(); LORAS=()
 n=$#; MEM=$(python -c "print(round(0.84 / $n, 2))")
 i=0
 for spec in "$@"; do
-  tag=${spec%%=*}; model=${spec#*=}; port=$((8001 + 2 * i))
+  tag=${spec%%=*}; model=${spec#*=}; port=$((8001 + 2 * i)); lora=""
+  case "$model" in *+*) lora=${model#*+}; model=${model%%+*};; esac
   [ -f "$model/config.json" ] || { echo "ERROR: $model is not a model dir"; exit 1; }
-  TAGS+=("$tag"); MODELS+=("$model"); PORTS+=("$port")
+  [ -z "$lora" ] || [ -f "$lora/adapter_config.json" ] || { echo "ERROR: $lora is not a LoRA dir"; exit 1; }
+  TAGS+=("$tag"); MODELS+=("$model"); PORTS+=("$port"); LORAS+=("$lora")
   CUDA_VISIBLE_DEVICES=0 "$VLLM_PY" "$HERE/vllm_token_server.py" --model "$model" --port "$port" \
-    --gpu-memory-utilization "$MEM" --max-num-seqs 32 > "$OUTPUT_ROOT/vllm_policy_$tag.log" 2>&1 &
+    --gpu-memory-utilization "$MEM" --max-num-seqs 32 ${lora:+--enable-lora --max-lora-rank 32} \
+    > "$OUTPUT_ROOT/vllm_policy_$tag.log" 2>&1 &
   PIDS+=($!); i=$((i + 1))
   sleep 60  # stagger engine start-up (memory profiling) on the shared GPU
 done
@@ -65,7 +70,7 @@ echo "[$(date +%T)] services ready: ${TAGS[*]}"
 pids=()
 for j in "${!TAGS[@]}"; do
   tag=${TAGS[$j]}; mkdir -p "$WORK/$tag"
-  VLLM_TOKEN_URL=http://127.0.0.1:${PORTS[$j]} python "$HERE/run_infer.py" --model qwen3-vl-4b-vllm \
+  VLLM_TOKEN_URL=http://127.0.0.1:${PORTS[$j]} VLLM_LORA_PATH=${LORAS[$j]} python "$HERE/run_infer.py" --model qwen3-vl-4b-vllm \
     --checkpoint "${MODELS[$j]}" --dataset test --data-path "$CASES" --output-dir "$WORK/$tag" --skip-existing \
     --workers "$WORKERS" --temperature 0 --max-tokens "$MAX_NEW_TOKENS" --log-level WARNING \
     > "$OUTPUT_ROOT/infer_$tag.log" 2>&1 &
