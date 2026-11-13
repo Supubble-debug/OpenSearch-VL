@@ -56,6 +56,7 @@ def main() -> int:
     ap.add_argument("--fatal-k", type=int, default=3)
     ap.add_argument("--workers", type=int, default=48)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--splits", default="seen,unseen", help="which splits to roll out (same sampling of questions)")
     args = ap.parse_args()
 
     import logging
@@ -74,6 +75,9 @@ def main() -> int:
     unseen = rng.sample(order[pos:], min(args.per_split, len(order) - pos))
     print(f"train {len(train)} q: drawn during RL {pos}, never drawn {len(order) - pos}; "
           f"checking {len(seen)} + {len(unseen)}, {args.samples} samples each, lora {lora}", flush=True)
+    want = set(args.splits.split(","))
+    seen = seen if "seen" in want else []
+    unseen = unseen if "unseen" in want else []
     rows = {i: train.iloc[i] for i in seen + unseen}
 
     os.makedirs(args.run_dir, exist_ok=True)
@@ -91,8 +95,11 @@ def main() -> int:
         print(f"{tag}: {len(flat)} rollouts, acc {statistics.mean(r['acc'] for r in flat):.3f}, "
               f"tools {statistics.mean(r['n_tools'] for r in flat):.2f}, "
               f"judge_failed {sum(r['judge_failed'] for r in flat)}", flush=True)
-    res = {"lora": lora, "samples": args.samples, "temperature": args.temperature}
+    res = {"lora": lora, "samples": args.samples, "temperature": args.temperature,
+           "per_question": {tag: acc[tag] for tag in acc}}
     for name, idx in (("seen", seen), ("unseen", unseen)):
+        if not idx:
+            continue
         ids = [train.iloc[i]["data_id"] for i in idx]
         ids = [q for q in ids if acc["base"].get(q) and acc["rl"].get(q)]
         res[name] = paired([statistics.mean(acc["base"][q]) for q in ids],
