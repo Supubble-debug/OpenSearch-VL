@@ -259,7 +259,14 @@ class Policy:
         return torch.tensor([ids], device="cuda:0"), torch.tensor(mask, device="cuda:0"), mm
 
     def token_logp(self, ids, mask, mm):
-        """Log-probs of masked target tokens; lm_head applied only there, in checkpointed chunks."""
+        """Log-probs of masked target tokens under the *sampling* policy.
+
+        The rollout policy samples with temperature T (top_p=1, top_k off), i.e.
+        p(x) ∝ exp(logits / T), so the log-probs the objective must use are
+        log_softmax(logits / T). Computing log_softmax(logits) instead (T=1) is a
+        different policy: the gradient then pushes tokens the T=0.7 policy would
+        under-sample. ``--temperature`` is the same value the runner samples with.
+        """
         torch = self.torch
         from torch.utils.checkpoint import checkpoint
 
@@ -269,8 +276,11 @@ class Policy:
         hs, ys = h[tgt - 1], ids[0, tgt]
         head = self.inner.lm_head
 
+        temp = max(float(self.args.temperature), 1e-6)
+
         def chunk(hc, yc):
-            return torch.log_softmax(head(hc).float(), -1).gather(-1, yc[:, None]).squeeze(-1)
+            logits = head(hc).float() / temp
+            return torch.log_softmax(logits, -1).gather(-1, yc[:, None]).squeeze(-1)
 
         c = self.args.logit_chunk
         return torch.cat([checkpoint(chunk, hs[i:i + c], ys[i:i + c], use_reentrant=False)

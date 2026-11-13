@@ -96,6 +96,7 @@ def main() -> None:
             top_p=float(req.get("top_p", 1.0)),
             top_k=int(req.get("top_k", -1)),
             stop_token_ids=req.get("stop_token_ids") or None,
+            logprobs=1 if req.get("logprobs") else None,
             seed=req.get("seed"),
             skip_special_tokens=True,
             spaces_between_special_tokens=False,
@@ -111,9 +112,13 @@ def main() -> None:
         async for out in engine.generate(prompt, params, request_id=uuid.uuid4().hex, lora_request=lora):
             final = out
         c = final.outputs[0]
+        lp = None
+        if c.logprobs:
+            lp = [next(iter(step.values())).logprob if step else None for step in c.logprobs]
         return {
             "text": c.text,
             "token_ids": list(c.token_ids),
+            "token_logprobs": lp,
             "finish_reason": c.finish_reason,  # "stop" | "length"
             "prompt_token_ids": list(final.prompt_token_ids or []),
         }

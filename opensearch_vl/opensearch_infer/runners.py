@@ -997,7 +997,8 @@ class Qwen35VLLMRunner(Qwen35SFTRunner):
             image_min_pixels=self._processor.image_min_pixels,
         )["images"]
 
-    def generate_raw(self, prompt_ids: List[int], images: List[Any], cfg: InferenceConfig) -> Dict[str, Any]:
+    def generate_raw(self, prompt_ids: List[int], images: List[Any], cfg: InferenceConfig,
+                     logprobs: bool = False) -> Dict[str, Any]:
         import requests
 
         encoded = []
@@ -1016,6 +1017,8 @@ class Qwen35VLLMRunner(Qwen35SFTRunner):
         }
         if self.lora_path:
             body["lora_path"] = self.lora_path
+        if logprobs:  # parity test / diagnostics: the server's own per-token log-probs
+            body["logprobs"] = True
         last: Optional[Exception] = None
         for attempt in range(4):
             try:
