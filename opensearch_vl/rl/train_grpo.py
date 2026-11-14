@@ -104,6 +104,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-judge-fail-rate", type=float, default=0.25,
                     help="stop if more than this share of rollouts had an unanswered judge call")
     ap.add_argument("--seed", type=int, default=20261113)
+    ap.add_argument("--exclude-ids", default=None,
+                    help="json list of train data_ids never to draw (held-out val); row indices / state.json stay valid")
     return ap.parse_args()
 
 
@@ -441,6 +443,9 @@ def main() -> int:
         state["order"] = rng.sample(range(len(train)), len(train))
     total_q = int(len(train) * args.epochs)
     consumed = state.get("consumed", 0)
+    excluded = set(json.load(open(args.exclude_ids))) if args.exclude_ids else set()
+    if excluded:
+        log.info("excluding %d train questions from sampling", len(excluded & set(train["data_id"])))
 
     def next_rows(k: int) -> List[Any]:
         nonlocal consumed
@@ -450,8 +455,11 @@ def main() -> int:
                 state["epoch"] += 1
                 state["pos"] = 0
                 state["order"] = random.Random(args.seed + state["epoch"]).sample(range(len(train)), len(train))
-            rows.append(train.iloc[state["order"][state["pos"]]])
+            row = train.iloc[state["order"][state["pos"]]]
             state["pos"] += 1
+            if row["data_id"] in excluded:
+                continue  # held out: skipped without counting as consumed
+            rows.append(row)
             consumed += 1
         return rows
 
@@ -460,12 +468,21 @@ def main() -> int:
             return
         t0 = time.time()
         rows = [dev.iloc[i] for i in range(len(dev))]
-        groups = roller.run(rows, args.dev_n, os.path.join(args.run_dir, "dev", f"step_{step:04d}"))
-        metrics.write(step, {**summarize(groups, "dev"), "dev/time_min": (time.time() - t0) / 60})
+        outdir = os.path.join(args.run_dir, "dev", f"step_{step:04d}")
+        groups = roller.run(rows, args.dev_n, outdir)
+        out = {**summarize(groups, "dev"), "dev/time_min": (time.time() - t0) / 60}
+        for sp in sorted(set(dev_split.values())):  # e.g. dev (85 audited) / val (held-out train q)
+            out.update(summarize({q: g for q, g in groups.items() if dev_split.get(q) == sp}, f"dev_{sp}"))
+        per_q = {q: [r["acc"] for r in g if not r["judge_failed"]] for q, g in groups.items()}
+        json.dump(per_q, open(os.path.join(outdir, "per_question.json"), "w"))
+        metrics.write(step, out)
 
-    if args.eval_at_start and state["step"] == 0 and not state.get("evaluated_start"):
-        evaluate(0)
-        state["evaluated_start"] = True
+    dev_split = ({str(a): str(b) for a, b in zip(dev["data_id"], dev["split"])}
+                 if dev is not None and "split" in dev.columns else {})
+    start_key = "evaluated_start" if state["step"] == 0 else f"evaluated_{state['step']}"
+    if args.eval_at_start and not state.get(start_key):  # also at a resume point (baseline of the new segment)
+        evaluate(state["step"])
+        state[start_key] = True
         json.dump(state, open(state_path, "w"))
 
     while True:
