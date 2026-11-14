@@ -104,6 +104,9 @@ sys.exit(1 if bad else 0)
 PY
 
 for tag in "${TAGS[@]}"; do
+  if [ -n "${SKIP_JUDGE:-}" ]; then  # inference only; judge offline later (e.g. another judge endpoint)
+    mkdir -p "$OUTPUT_ROOT/trajectories/$tag"; cp "$WORK/$tag"/*_trajectory.json "$OUTPUT_ROOT/trajectories/$tag/"; continue
+  fi
   python "$HERE/eval_with_gpt4o.py" --traj_dir "$WORK/$tag" --benchmark vdr --max_workers 8 2>&1 | grep -vE "it/s|s/it" | tail -3
   python "$HERE/eval_with_gpt4o.py" --traj_dir "$WORK/$tag" --benchmark vdr_strict --strict --max_workers 8 2>&1 | grep -vE "it/s|s/it" | tail -3
   mkdir -p "$OUTPUT_ROOT/trajectories/$tag"
