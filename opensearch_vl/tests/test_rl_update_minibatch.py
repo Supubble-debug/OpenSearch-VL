@@ -43,7 +43,8 @@ class ToyInner(nn.Module):
 class ToyPolicy(nn.Module):
     def __init__(self):
         super().__init__()
-        self.base_model = types.SimpleNamespace(model=ToyInner())
+        self.inner = ToyInner()  # registered submodule so .parameters() sees it
+        self.base_model = types.SimpleNamespace(model=self.inner)
 
 
 def make_policy(args):
@@ -79,8 +80,10 @@ def main() -> int:
     frozen = copy.deepcopy(policy.inner.state_dict())  # pre-update weights
 
     def sample(ids, adv):
-        return {"contents": None, "fatal_turn": None, "adv": adv,
-                "ids": torch.tensor([ids]), "mask": torch.tensor([0] + [1] * (len(ids) - 1)), "mm": {}}
+        d = {"fatal_turn": None, "adv": adv,
+             "ids": torch.tensor([ids]), "mask": torch.tensor([0] + [1] * (len(ids) - 1)), "mm": {}}
+        d["contents"] = d  # update() passes s["contents"] to encode(); the stub reads ids from it
+        return d
 
     def fake_encode(contents, fatal_turn):
         s = contents
