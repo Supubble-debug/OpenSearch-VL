@@ -1052,6 +1052,26 @@ def _to_data_uri(url_or_b64: str, mime: str = "") -> str:
     return f"data:{mime};base64,{url_or_b64}"
 
 
+TEACHER_RULES = """
+
+### MANDATORY RULES FOR THIS RUN (these trajectories are demonstrations for a smaller agent)
+1. Do NOT answer from memory or from a guess. Your final answer must be supported by text that appears in a
+   tool output of this conversation. If no tool output supports an answer yet, keep investigating.
+2. If you are not certain what the key entity in the image is (place, artwork, person, product, species,
+   logo, event), you MUST first use image_search on the image, or crop the relevant region and image_search
+   the crop. If the image contains readable text (signs, labels, plates, captions), read it with crop or
+   layout_parsing and use it.
+3. Check image_search results against visible details of the image. If they do not match, do not accept
+   them: crop a different region and search again, or search text you read from the image.
+4. If a text_search does not return the needed fact, change the query substantially (aliases, official
+   names, the other candidate entity, a different hop, a date or place qualifier). Never repeat a
+   near-identical query.
+5. For multi-hop questions, confirm each intermediate entity with a tool output before moving to the next hop.
+6. Before giving the final answer, re-read the question and answer exactly what is asked, at the requested
+   granularity and format (e.g. city vs country, exact name vs category, YYYY-MM-DD).
+"""
+
+
 class OpenAICompatRunner(BaseRunner):
     """Chat Completions API with image parts; text-format tool calls as for the student."""
 
@@ -1102,6 +1122,8 @@ class OpenAICompatRunner(BaseRunner):
         import requests
 
         cfg = cfg or InferenceConfig()
+        if os.environ.get("TEACHER_RULES", "0") == "1":
+            system_instruction = (system_instruction or "") + TEACHER_RULES
         body: Dict[str, Any] = {
             "model": self.model,
             "messages": self.to_messages(contents, system_instruction),

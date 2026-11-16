@@ -4,7 +4,7 @@
 # environment as the student: local OCR (:8080) + local 27B summariser (:8000), DeepSeek
 # text search, Doubao image search. Inference only; judge separately.
 #   bash opensearch_vl/run_teacher.sh <cases.parquet> <work_dir> [tag]
-# Env: TEACHER_MODEL, TEACHER_THINKING, TEMPERATURE (0.6), WORKERS (8), AGENT_MAX_TURNS (15),
+# Env: TEACHER_MODEL, TEACHER_THINKING, TEACHER_RULES (1 = evidence-first rules), TEMPERATURE (0.6), WORKERS (8), AGENT_MAX_TURNS (15),
 #      MIN_DEEPSEEK_CNY (5), TOOL_CACHE_DB (default <work_dir>/tool_cache.sqlite).
 set -uo pipefail
 CASES=${1:?cases parquet}; WORK=${2:?work dir}; TAG=${3:-teacher}
@@ -41,7 +41,7 @@ for svc in http://127.0.0.1:8080/docs http://127.0.0.1:8000/v1/models; do
 done
 export QWEN_API_BASE=http://127.0.0.1:8000/v1 QWEN_MODEL=summariser QWEN_MODEL_NAME=summariser QWEN_API_KEY=
 export SUMMARY_EXTRA_BODY_JSON='{"top_p": 0.8, "top_k": 20, "chat_template_kwargs": {"enable_thinking": false}}'
-echo "[$(date +%T)] services ready; teacher ${TEACHER_MODEL:-deepseek-flash} thinking=${TEACHER_THINKING:-0}"
+echo "[$(date +%T)] services ready; teacher ${TEACHER_MODEL:-deepseek-flash} thinking=${TEACHER_THINKING:-0} rules=${TEACHER_RULES:-0}"
 python "$HERE/run_infer.py" --model deepseek-teacher --dataset test --data-path "$CASES" --output-dir "$WORK/$TAG" \
   --skip-existing --workers "${WORKERS:-8}" --temperature "${TEMPERATURE:-0.6}" --max-tokens 8192 --log-level WARNING \
   > "$OUTPUT_ROOT/infer_$TAG.log" 2>&1
