@@ -1142,6 +1142,11 @@ class OpenAICompatRunner(BaseRunner):
                     ch = j["choices"][0]
                     text = ch["message"].get("content") or ""
                     reasoning = ch["message"].get("reasoning_content") or ""
+                    # With thinking on, DeepSeek sometimes puts the whole turn (incl. the tool call /
+                    # response tag) into reasoning_content and leaves content empty: recover it.
+                    if not text.strip() and ("<tool_call>" in reasoning or "<response>" in reasoning):
+                        tail = reasoning.split("</think>")[-1]
+                        text = tail if ("<tool_call>" in tail or "<response>" in tail) else reasoning
                     # DeepSeek sometimes leaks its native function-call markup into the text.
                     text = re.sub(r"</?\s*｜｜DSML｜｜[^>]*>\s*", "", text)
                     # The API strips the stop sequence; restore it so the pipeline parses the tag.
