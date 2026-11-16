@@ -1,0 +1,55 @@
+# ImagentRL SFT v3a (pilot, 2026-11-16): continued SFT on top of the merged v2 model with a fresh LoRA.
+# Data: ~400 filtered DeepSeek-flash teacher trajectories (thinking + evidence-first rules; the rules are not in the data)
+# + 1000 random v2 samples replayed (opensearch_vl/build_sft_mix.py). Other hyper-parameters as v2, lr halved.
+# Launch with FORCE_TORCHRUN=1 (both GPUs).
+
+### model
+model_name_or_path: /root/models/qwen3vl4b-sft-v2-merged   # continue from v2 (merged), fresh LoRA
+image_max_pixels: 262144            # 512×512, as in the paper's SFT configs
+trust_remote_code: true
+enable_liger_kernel: true          # fused linear+CE: no fp32 logits (151k vocab × ~30k tokens)
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 32
+lora_alpha: 64                      # 2× rank
+lora_dropout: 0.05
+lora_target: all                    # every linear layer of the LLM
+freeze_vision_tower: true           # LoRA on the language model only
+freeze_multi_modal_projector: true
+
+### dataset  (dataset_dir + dataset_info.json are written by the selection run)
+dataset_dir: /root/datasets/sft_v3a_mix
+dataset: imagentrl_sft_v3a
+template: qwen3_vl                  # paper's template; JSON <tool_call> instructions match the data
+cutoff_len: 32000                   # selection drops samples > 0.97 × cutoff (Qwen3-VL tokenizer)
+overwrite_cache: false
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+
+### output
+output_dir: /root/sft-runs/qwen3_vl_4b_lora_sft_v3a
+logging_steps: 5
+save_steps: 64
+save_total_limit: 8
+plot_loss: true
+overwrite_output_dir: false             # never clobber a finished run; a crashed run resumes from its last checkpoint
+save_only_model: false
+report_to: wandb                    # launcher runs WANDB_MODE=offline (api.wandb.ai 403 from westd)
+run_name: qwen3_vl_4b_lora_sft_v3a
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 2      # 1 × 2 GPUs × 2 = effective batch size 4
+num_train_epochs: 1.0
+learning_rate: 5.0e-5                # half of v2: continued training on top of v2
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+weight_decay: 0.0
+max_grad_norm: 1.0
+bf16: true
+gradient_checkpointing: true
+ddp_timeout: 1800                   # rank 0 tokenises the dataset while rank 1 waits
+seed: 42
