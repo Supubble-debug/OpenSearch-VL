@@ -8,7 +8,9 @@ do not overlap anything become the test set (--per-bench per benchmark).
 
 Overlap = text (exact / 5-gram Jaccard >= 0.7 for questions of >= 8 words) or image pHash
 (Hamming <= 6) against: the dev set, SFT-36K, every RL parquet given with --rl, and earlier
-test rows (no near-duplicate pairs inside the test set). Short questions match by image only.
+test rows (no near-duplicate pairs inside the test set). Questions shorter than --text-min-words
+match by image only: benchmark templates such as InfoSeek's "Which body of water is this place
+located in or next to?" recur with different images and are not duplicates.
 
     python build_eval_holdout.py --src /root/datasets/vdr-eval/data \
         --dev /root/autodl-fs/datasets/imagentrl/eval/paper7_n50.parquet \
@@ -70,6 +72,7 @@ def main() -> int:
     ap.add_argument("--per-bench", type=int, default=50)
     ap.add_argument("--seed", type=int, default=20261104)
     ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--text-min-words", type=int, default=15)
     args = ap.parse_args()
 
     items = brc.load_sft_items(Path(args.sft_root), with_images=False)
@@ -130,10 +133,11 @@ def main() -> int:
             q = PREFIX_RE.sub("", str(row["question"]))
             qn = brc.norm_q(q)
             ph = _hash_bytes(images[0]["bytes"])
-            m = index.match("" if len(qn.split()) < 8 else qn, ph)
+            long_q = len(qn.split()) >= args.text_min_words
+            m = index.match(qn if long_q else "", ph)
             if m is None:  # near-duplicates inside the test set
                 for o in test_here:
-                    if (qn and len(qn.split()) >= 8 and qn == o[0]) or (ph is not None and o[1] is not None
+                    if (long_q and qn == o[0]) or (ph is not None and o[1] is not None
                                                                          and bin(ph ^ o[1]).count("1") <= 6):
                         m = ("test_dup", {"bench": bench, "id": o[2]})
                         break
