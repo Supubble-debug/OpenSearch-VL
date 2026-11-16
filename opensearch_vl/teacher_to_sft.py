@@ -8,7 +8,7 @@ teacher ran on (for the original images).
 A trajectory is kept only if:
   - the strict judge says correct (judge_failed rows are skipped, not counted as correct);
   - it ended with a <response> (stop_reason == "response") and made >= --min-calls tool calls;
-  - every assistant turn has a <think> block and no turn leaks the teacher-only rules;
+  - every tool-call turn has a <think> block and no turn leaks the teacher-only rules;
   - every tool call parsed (no tool_error) and every tool-returned image file exists.
 At most --per-question kept trajectories per question (fewest repeated queries first).
 
@@ -53,7 +53,7 @@ def convert(t: dict, orig_image: str) -> tuple[dict | None, str, int]:
     calls, queries = 0, []
     for x in t["turns"]:
         text = x.get("response_text") or ""
-        if "<think>" not in text:
+        if "<think>" not in text and x.get("tool_call"):  # final answer turns may skip it (5% of v2 data do)
             return None, "no_think", 0
         if RULE_LEAK.search(text):
             return None, "rule_leak", 0
