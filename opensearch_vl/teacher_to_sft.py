@@ -9,7 +9,9 @@ A trajectory is kept only if:
   - the strict judge says correct (judge_failed rows are skipped, not counted as correct);
   - it ended with a <response> (stop_reason == "response") and made >= --min-calls tool calls;
   - every tool-call turn has a <think> block and no turn leaks the teacher-only rules;
-  - every tool call parsed (no tool_error) and every tool-returned image file exists.
+  - every tool call parsed (no tool_error) and every tool-returned image file exists;
+  - the gold answer (or an alias) appears in some tool output, i.e. the answer was found, not
+    recalled or guessed (--no-evidence-check to disable).
 At most --per-question kept trajectories per question (fewest repeated queries first).
 
 System prompt and tool schema are copied verbatim from the v2 SFT data, so the student sees
@@ -27,10 +29,27 @@ import os
 import re
 from pathlib import Path
 
+import unicodedata
+
 import pandas as pd
 
+GOLDS = None  # case_id -> [gold, *aliases]; set in main() unless --no-evidence-check
 RULE_LEAK = re.compile(r"(?i)mandatory rules|rule ?[1-6]\b|per the rules?|the rules say|demonstrations? for a smaller")
 IMG_PATH = re.compile(r"uploaded to: (\S+?\.(?:png|jpe?g|webp))", re.I)
+
+
+def _norm(x: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKC", str(x)).lower() if c.isalnum())
+
+
+def evidence_hit(t: dict, golds: list) -> bool:
+    """True if every part of some gold variant appears in a tool output (answer grounded, not recalled)."""
+    hay = _norm(" ".join(x.get("tool_output") or "" for x in t["turns"]))
+    for g in golds:
+        parts = [p for p in (_norm(z) for z in re.split(r"[;；,，/]| or ", str(g))) if p]
+        if parts and all(p in hay for p in parts):
+            return True
+    return False
 
 
 def judged(sample_dir: str) -> dict:
@@ -80,6 +99,8 @@ def convert(t: dict, orig_image: str) -> tuple[dict | None, str, int]:
         conv.append({"from": "observation", "value": obs})
     if conv[-1]["from"] != "gpt" or "<response>" not in conv[-1]["value"]:
         return None, "no_final_response", 0
+    if GOLDS is not None and not evidence_hit(t, GOLDS.get(t["case_id"], [])):
+        return None, "no_evidence_in_tool_output", 0
     return {"conversations": conv, "images": images, "n_calls": calls}, "", len(queries) - len(set(queries))
 
 
@@ -91,7 +112,10 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--per-question", type=int, default=2)
     ap.add_argument("--min-calls", type=int, default=1)
+    ap.add_argument("--no-evidence-check", action="store_true")
+    ap.add_argument("--exclude-ids", default=None, help="json list of case_ids to drop (e.g. flagged by a second audit)")
     args = ap.parse_args()
+    global GOLDS
 
     v2 = json.load(open(args.v2_data, encoding="utf-8"))
     system, tools = v2[0]["system"], v2[0]["tools"]
@@ -99,6 +123,10 @@ def main() -> int:
     (out / "images").mkdir(parents=True, exist_ok=True)
 
     cases = pd.read_parquet(args.cases)
+    if not args.no_evidence_check:
+        GOLDS = {r["data_id"]: [r["answer"]] + [str(a) for a in (list(r["aliases"]) if "aliases" in cases.columns
+                 and r["aliases"] is not None else [])] for _, r in cases.iterrows()}
+    excluded = set(json.load(open(args.exclude_ids))) if args.exclude_ids else set()
     orig = {}
     for _, r in cases.iterrows():
         p = out / "images" / f"{r['data_id']}.png"
@@ -115,6 +143,9 @@ def main() -> int:
         for p in sorted(Path(sd).glob("*_trajectory.json")):
             t = json.load(open(p, encoding="utf-8"))
             q = t["case_id"]
+            if q in excluded:
+                reasons["excluded_by_audit"] += 1
+                continue
             if q not in J:
                 reasons["judge_failed_or_missing"] += 1
                 continue
