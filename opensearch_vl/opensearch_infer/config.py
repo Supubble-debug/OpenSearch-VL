@@ -270,6 +270,15 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
         default_checkpoint="",
         supports_multi_gpu=False,
     ),
+    # Teacher for SFT data: any OpenAI-compatible vision chat API (default: official DeepSeek).
+    # Env: TEACHER_API_BASE (default DEEPSEEK_API_BASE), TEACHER_API_KEY (default DEEPSEEK_API_KEY),
+    # TEACHER_MODEL (default deepseek-flash), TEACHER_THINKING=1 to enable thinking.
+    "deepseek-teacher": ModelSpec(
+        name="deepseek-teacher",
+        family="openai_compat",
+        display_name="DeepSeek teacher (OpenAI-compatible API)",
+        supports_multi_gpu=False,
+    ),
     "minimax-m3.1-flash": ModelSpec(
         name="minimax-m3.1-flash",
         family="minimax",

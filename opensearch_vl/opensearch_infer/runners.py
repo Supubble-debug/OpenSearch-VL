@@ -37,7 +37,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from PIL import Image
 
-from . import auth, config, messages
+from . import auth, config, image_io, messages
 from .config import ModelSpec
 
 
@@ -1037,6 +1037,117 @@ class Qwen35VLLMRunner(Qwen35SFTRunner):
 
 
 # ---------------------------------------------------------------------------
+# OpenAI-compatible API (teacher trajectories, e.g. official DeepSeek)
+# ---------------------------------------------------------------------------
+
+
+def _to_data_uri(url_or_b64: str, mime: str = "") -> str:
+    if url_or_b64.startswith(("data:", "http://", "https://")):
+        return url_or_b64
+    if os.path.exists(url_or_b64):
+        with open(url_or_b64, "rb") as fh:
+            url_or_b64 = image_io.image_to_base64(fh.read()) or ""
+    mime = mime or image_io.detect_image_format(url_or_b64) or "image/jpeg"
+    return f"data:{mime};base64,{url_or_b64}"
+
+
+class OpenAICompatRunner(BaseRunner):
+    """Chat Completions API with image parts; text-format tool calls as for the student."""
+
+    def __init__(self, spec: ModelSpec) -> None:
+        super().__init__(spec)
+        self.base = (os.environ.get("TEACHER_API_BASE") or os.environ.get("DEEPSEEK_API_BASE")
+                     or "https://api.deepseek.com").rstrip("/")
+        self.key = os.environ.get("TEACHER_API_KEY") or os.environ.get("DEEPSEEK_API_KEY", "")
+        self.model = os.environ.get("TEACHER_MODEL", "deepseek-flash")
+        self.thinking = os.environ.get("TEACHER_THINKING", "0") == "1"
+
+    @property
+    def display_name(self) -> str:
+        return f"{self.model}{' (thinking)' if self.thinking else ''}"
+
+    @staticmethod
+    def to_messages(contents: Iterable[Dict[str, Any]], system: Optional[str]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = [{"role": "system", "content": system}] if system else []
+        for item in contents:
+            role = "assistant" if item.get("role") == "model" else "user"
+            blocks: List[Dict[str, Any]] = []
+            for part in item.get("parts", []) or []:
+                if "image_url" in part:
+                    v = part["image_url"]
+                    url = v.get("url", "") if isinstance(v, dict) else str(v)
+                    if url:
+                        blocks.append({"type": "image_url", "image_url": {"url": _to_data_uri(url)}})
+                elif "inline_data" in part:
+                    d = part["inline_data"]
+                    blocks.append({"type": "image_url", "image_url": {
+                        "url": _to_data_uri(d.get("data", ""), d.get("mime_type", ""))}})
+                elif "text" in part:
+                    blocks.append({"type": "text", "text": part["text"]})
+            if not blocks:
+                continue
+            if role == "assistant":  # assistant turns are plain text
+                out.append({"role": role, "content": "".join(b.get("text", "") for b in blocks)})
+            else:
+                out.append({"role": role, "content": blocks})
+        return out
+
+    def infer(
+        self,
+        contents: Iterable[Dict[str, Any]],
+        system_instruction: Optional[str] = None,
+        cfg: Optional[InferenceConfig] = None,
+    ) -> Dict[str, Any]:
+        import requests
+
+        cfg = cfg or InferenceConfig()
+        body: Dict[str, Any] = {
+            "model": self.model,
+            "messages": self.to_messages(contents, system_instruction),
+            "max_tokens": min(cfg.max_tokens, 8192),
+            "temperature": cfg.temperature,
+            "stop": ["</tool_call>", "</response>"],
+            "thinking": {"type": "enabled" if self.thinking else "disabled"},
+        }
+        last = ""
+        for attempt in range(5):
+            try:
+                r = requests.post(f"{self.base}/chat/completions", json=body, timeout=600,
+                                  headers={"Authorization": f"Bearer {self.key}"})
+                if r.status_code == 200:
+                    j = r.json()
+                    ch = j["choices"][0]
+                    text = ch["message"].get("content") or ""
+                    reasoning = ch["message"].get("reasoning_content") or ""
+                    # The API strips the stop sequence; restore it so the pipeline parses the tag.
+                    for tag in ("tool_call", "response"):
+                        if f"<{tag}>" in text and f"</{tag}>" not in text.split(f"<{tag}>")[-1]:
+                            text += f"</{tag}>"
+                    u = j.get("usage", {}) or {}
+                    finish = {"length": "MAX_TOKENS"}.get(ch.get("finish_reason"), "STOP")
+                    return {
+                        "candidates": [{"content": {"role": "model", "parts": [{"text": text}]},
+                                        "finishReason": finish}],
+                        "usageMetadata": {
+                            "promptTokenCount": u.get("prompt_tokens", 0),
+                            "candidatesTokenCount": u.get("completion_tokens", 0),
+                            "totalTokenCount": u.get("total_tokens", 0),
+                            "cachedTokenCount": u.get("prompt_cache_hit_tokens", 0),
+                        },
+                        "modelVersion": self.display_name,
+                        "reasoning_content": reasoning,
+                    }
+                last = f"HTTP {r.status_code}: {r.text[:200]}"
+                if r.status_code in (400, 401, 402, 403):
+                    break
+            except Exception as exc:  # noqa: BLE001
+                last = repr(exc)[:200]
+            time.sleep(3 * (attempt + 1))
+        logger.error("Teacher inference failed: %s", last)
+        return _empty_response(self.display_name, last)
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -1058,6 +1169,8 @@ def build_runner(
         return ClaudeRunner(spec)
     if spec.family == "minimax":
         return MiniMaxRunner(spec)
+    if spec.family == "openai_compat":
+        return OpenAICompatRunner(spec)
     if spec.family == "qwen3_5" and spec.extra.get("backend") == "vllm":
         return Qwen35VLLMRunner(
             spec,
