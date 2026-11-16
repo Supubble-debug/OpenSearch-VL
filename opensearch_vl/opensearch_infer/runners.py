@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import base64
 import io
 import logging
@@ -1119,6 +1120,8 @@ class OpenAICompatRunner(BaseRunner):
                     ch = j["choices"][0]
                     text = ch["message"].get("content") or ""
                     reasoning = ch["message"].get("reasoning_content") or ""
+                    # DeepSeek sometimes leaks its native function-call markup into the text.
+                    text = re.sub(r"</?\s*｜｜DSML｜｜[^>]*>\s*", "", text)
                     # The API strips the stop sequence; restore it so the pipeline parses the tag.
                     for tag in ("tool_call", "response"):
                         if f"<{tag}>" in text and f"</{tag}>" not in text.split(f"<{tag}>")[-1]:
