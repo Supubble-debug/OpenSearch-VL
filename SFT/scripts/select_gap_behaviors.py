@@ -76,7 +76,13 @@ def main() -> int:
     ap.add_argument("--n", type=int, default=1000)
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=20261117)
+    ap.add_argument("--unaudited-from", default=None,
+                    help="candidates mode: score trajectories NOT in this manifest (e.g. the v2 cand10000 one) and NOT\n"
+                         "excluded, keep those with rewrite or long, write cand_ids.txt (to be audited)")
+    ap.add_argument("--cap-per-source", type=int, default=400)
     args = ap.parse_args()
+    if args.unaudited_from:
+        return candidates(args)
 
     audited = [json.loads(l) for l in open(args.audited, encoding="utf-8")]
     used = set()
@@ -112,6 +118,38 @@ def main() -> int:
               "picked_by_cat": dict(collections.Counter(pool[x[0]].get("cat") for x in pick))}
     json.dump(report, open(out / "report.json", "w"), indent=1)
     print(json.dumps(report))
+    return 0
+
+
+def candidates(args) -> int:
+    seen = {json.loads(l)["id"] for l in open(args.unaudited_from, encoding="utf-8")}
+    for p in args.exclude:
+        seen |= {json.loads(l)["id"] for l in open(p, encoding="utf-8")}
+    root = Path(args.data_root)
+    by_src = collections.defaultdict(list)
+    for src, fname in sel.SOURCES.items():
+        p = root / src / fname
+        if not p.exists():
+            continue
+        for idx, s in enumerate(json.load(open(p, encoding="utf-8"))):
+            sid = f"{src}:{idx}"
+            if sid in seen:
+                continue
+            f = features(calls_of(s))
+            if f["rewrite"] or f["long"]:
+                by_src[src].append((sid, sum(f.values())))
+    rng = random.Random(args.seed)
+    ids = []
+    for src, lst in by_src.items():
+        rng.shuffle(lst)
+        lst.sort(key=lambda x: -x[1])
+        ids += [x[0] for x in lst[: args.cap_per_source]]
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "cand_ids.txt").write_text("".join(i + "\n" for i in ids))
+    rep = {"by_source_available": {k: len(v) for k, v in by_src.items()}, "candidates": len(ids)}
+    json.dump(rep, open(out / "cand_report.json", "w"), indent=1)
+    print(json.dumps(rep))
     return 0
 
 
