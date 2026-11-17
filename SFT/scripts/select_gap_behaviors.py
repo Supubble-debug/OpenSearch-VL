@@ -71,7 +71,7 @@ def features(calls: list[tuple[str, dict]]) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-root", required=True)
-    ap.add_argument("--audited", required=True)
+    ap.add_argument("--audited", default=None, help="v2 final_keep.jsonl (required unless --unaudited-from)")
     ap.add_argument("--exclude", nargs="*", default=[])
     ap.add_argument("--n", type=int, default=1000)
     ap.add_argument("--out", required=True)
@@ -83,6 +83,8 @@ def main() -> int:
     args = ap.parse_args()
     if args.unaudited_from:
         return candidates(args)
+    if not args.audited:
+        ap.error("--audited is required unless --unaudited-from is given")
 
     audited = [json.loads(l) for l in open(args.audited, encoding="utf-8")]
     used = set()
