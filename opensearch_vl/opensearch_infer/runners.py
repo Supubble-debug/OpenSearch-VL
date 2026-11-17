@@ -1131,6 +1131,8 @@ class OpenAICompatRunner(BaseRunner):
             "temperature": cfg.temperature,
             "stop": ["</tool_call>", "</response>"],
             "thinking": {"type": "enabled" if self.thinking else "disabled"},
+            # provider-specific extras, e.g. '{"enable_thinking": true}' for Qwen on Bailian
+            **json.loads(os.environ.get("TEACHER_EXTRA_BODY_JSON", "") or "{}"),
         }
         last = ""
         for attempt in range(5):
