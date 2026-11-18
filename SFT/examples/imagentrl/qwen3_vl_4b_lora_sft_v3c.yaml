@@ -33,7 +33,7 @@ dataloader_num_workers: 4
 output_dir: /root/sft-runs/qwen3_vl_4b_lora_sft_v3c
 logging_steps: 5
 save_steps: 128
-save_total_limit: 8
+save_total_limit: 3                 # system disk is 127G and was full on 2026-11-18; keep the last 3 only
 plot_loss: true
 overwrite_output_dir: false             # never clobber a finished run; a crashed run resumes from its last checkpoint
 save_only_model: false
