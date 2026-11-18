@@ -9,14 +9,14 @@ import argparse, json, os, random
 from pathlib import Path
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--new", required=True)
+ap.add_argument("--new", required=True, nargs="+")
 ap.add_argument("--replay", required=True)
 ap.add_argument("--n-replay", type=int, default=1000)
 ap.add_argument("--out", required=True)
 ap.add_argument("--name", required=True)
 ap.add_argument("--seed", type=int, default=20261116)
 a = ap.parse_args()
-new = json.load(open(a.new, encoding="utf-8"))
+new = [x for f in a.new for x in json.load(open(f, encoding="utf-8"))]
 old = json.load(open(a.replay, encoding="utf-8"))
 rep = random.Random(a.seed).sample(old, min(a.n_replay, len(old)))
 data = new + rep
