@@ -1,0 +1,56 @@
+# ImagentRL SFT v3d (2026-11-18): gap-targeted continued SFT on top of the merged v2 model, fresh LoRA.
+# New data: 1,363 SFT-36K trajectories picked by question type/domain tags (obscure multi-hop; film/game, news,
+# product, organisation; InfoSeek-like), 27B two-pass vision audit + Bailian re-audit (incl. full-trajectory
+# re-judge of long ones). Mix: new x2 + ~2,700 v2 replay (all >=5-call v2 samples + stratified fill), 1 epoch,
+# lr 1e-4 (SFT/scripts/build_sft_v3d_mix.py). Launch with FORCE_TORCHRUN=1.
+
+### model
+model_name_or_path: /root/models/qwen3vl4b-sft-v2-merged   # continue from v2 (merged), fresh LoRA
+image_max_pixels: 262144            # 512×512, as in the paper's SFT configs
+trust_remote_code: true
+enable_liger_kernel: true          # fused linear+CE: no fp32 logits (151k vocab × ~30k tokens)
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 32
+lora_alpha: 64                      # 2× rank
+lora_dropout: 0.05
+lora_target: all                    # every linear layer of the LLM
+freeze_vision_tower: true           # LoRA on the language model only
+freeze_multi_modal_projector: true
+
+### dataset  (dataset_dir + dataset_info.json are written by the selection run)
+dataset_dir: /root/datasets/sft_v3d_mix
+dataset: imagentrl_sft_v3d
+template: qwen3_vl                  # paper's template; JSON <tool_call> instructions match the data
+cutoff_len: 32000                   # selection drops samples > 0.97 × cutoff (Qwen3-VL tokenizer)
+overwrite_cache: false
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+
+### output
+output_dir: /root/sft-runs/qwen3_vl_4b_lora_sft_v3d
+logging_steps: 5
+save_steps: 256
+save_total_limit: 3                 # system disk is 127G and was full on 2026-11-18; keep the last 3 only
+plot_loss: true
+overwrite_output_dir: false             # never clobber a finished run; a crashed run resumes from its last checkpoint
+save_only_model: false
+report_to: wandb                    # launcher runs WANDB_MODE=offline (api.wandb.ai 403 from westd)
+run_name: qwen3_vl_4b_lora_sft_v3d
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 2      # 1 × 2 GPUs × 2 = effective batch size 4
+num_train_epochs: 1.0                # new data is duplicated x2 in the mix; each replay sample seen once
+learning_rate: 1.0e-4                # v3a/v3b used 5e-5 and did not move accuracy (diag 2026-11-18)
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+weight_decay: 0.0
+max_grad_norm: 1.0
+bf16: true
+gradient_checkpointing: true
+ddp_timeout: 1800                   # rank 0 tokenises the dataset while rank 1 waits
+seed: 42
