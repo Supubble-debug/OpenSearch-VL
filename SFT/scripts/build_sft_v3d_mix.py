@@ -17,6 +17,7 @@ ap.add_argument("--final-ids", required=True)
 ap.add_argument("--cand-dir", default="/root/sft-audit/v3d/cand")
 ap.add_argument("--v2-dir", default="/root/datasets/sft_subset_q3vl_v2")
 ap.add_argument("--n-replay", type=int, default=2700)
+ap.add_argument("--replay-all", action="store_true", help="replay the whole v2 subset (v3e: train from the base model)")
 ap.add_argument("--long-calls", type=int, default=5)
 ap.add_argument("--new-copies", type=int, default=2)
 ap.add_argument("--out", required=True)
@@ -53,7 +54,7 @@ for k, lst in strata.items():
     rng.shuffle(lst)
     fill += lst[: round(need * len(lst) / len(rest))]
 rng.shuffle(fill)
-replay_idx = long_idx + fill[:need]
+replay_idx = idx if a.replay_all else long_idx + fill[:need]
 replay = [vdata[i] for i in replay_idx]
 
 data = new * a.new_copies + replay
