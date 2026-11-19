@@ -73,5 +73,24 @@ def cached(tool: str, k: str, compute: Callable[[], str]) -> str:
     return value
 
 
+def log_raw(query: str, top_k: int, pages: list) -> None:
+    """Diagnosis only: when RAW_LOG_DB is set, keep the page text the summariser saw for each
+    (uncached) text_search, so 'answer in the raw page but lost by the summary' can be measured."""
+    path = os.environ.get("RAW_LOG_DB")
+    if not path:
+        return
+    import json
+    try:
+        conn = sqlite3.connect(path, timeout=60)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE IF NOT EXISTS raw (q TEXT, top_k INTEGER, v TEXT, t REAL)")
+        conn.execute("INSERT INTO raw VALUES (?,?,?,?)",
+                     (query, int(top_k), json.dumps(pages, ensure_ascii=False), time.time()))
+        conn.commit()
+        conn.close()
+    except Exception:  # never break the tool call for a diagnostic log
+        pass
+
+
 def stats() -> dict:
     return dict(_stats)

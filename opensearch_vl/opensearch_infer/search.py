@@ -473,10 +473,14 @@ def _text_search_deepseek_uncached(query: str, top_k: int) -> str:
             content = _deepseek_fetch(url)
         if not content:
             content = item.get("summary") or item.get("snippet") or ""
-        return summarize_with_qwen(content=content, query=query, title=title)
+        return content, summarize_with_qwen(content=content, query=query, title=title)
 
     with ThreadPoolExecutor(max_workers=len(results)) as pool:
-        summaries = list(pool.map(one, results))
+        pairs = list(pool.map(one, results))
+    summaries = [s for _, s in pairs]
+    tool_cache.log_raw(query.strip(), top_k, [
+        {"url": it.get("url", ""), "title": it.get("title", ""), "content": c[:15000], "summary": s}
+        for it, (c, s) in zip(results, pairs)])
 
     out = "Tool execution result:\n\n"
     for idx, (item, summary) in enumerate(zip(results, summaries), start=1):
