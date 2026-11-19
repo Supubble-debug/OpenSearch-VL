@@ -31,10 +31,16 @@ contains the answer. Hard rules:
 - In the final <response>, give the answer and state which tool result (turn and passage) contains it. If after a
   thorough investigation no tool output contains it, say EVIDENCE_NOT_FOUND."""
 
+HINT_C = """
+
+[HINT - for this run only]: the key entity shown in the image is: {entity}. The answer is NOT given; find it with
+the tools. The final answer must be supported by a tool output of this conversation."""
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--ids", required=True)
 ap.add_argument("--eval", nargs="+", required=True)
 ap.add_argument("--out-dir", required=True)
+ap.add_argument("--hints", help="group C: {case_id: {entity, reveals_answer}} -> reachC.parquet")
 a = ap.parse_args()
 ids = json.load(open(a.ids))
 df = pd.concat([pd.read_parquet(p) for p in a.eval]).drop_duplicates("data_id")
@@ -48,5 +54,13 @@ b = df.copy()
 b["prompt"] = [[{**m[0], "content": m[0]["content"] + HINT.format(gold=g)}] + list(m[1:])
                for m, g in zip(b.prompt, b.answer)]
 b.to_parquet(out / "reachB.parquet")
+if a.hints:  # group C: only the key entity of the image is given (no answer); questions whose entity is the answer drop out
+    h = json.load(open(a.hints))
+    keep = [bool(h.get(q, {}).get("entity")) and not h[q]["reveals_answer"] for q in df.data_id]
+    c = df[keep].copy()
+    c["prompt"] = [[{**m[0], "content": m[0]["content"] + HINT_C.format(entity=h[q]["entity"])}] + list(m[1:])
+                   for m, q in zip(c.prompt, c.data_id)]
+    c.to_parquet(out / "reachC.parquet")
+    print(f"group C: {len(c)} of {len(df)} cases have a usable entity hint")
 print(f"{len(df)} cases ({sum(v == 'zero16' for v in ids.values())} zero16, "
       f"{sum(v == 'control' for v in ids.values())} control) -> {out}")
