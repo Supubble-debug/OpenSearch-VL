@@ -4,7 +4,8 @@
 For eval questions that v2 + v3d never solved (16/16 wrong) plus easy controls, build two case files:
   reachA.parquet  the question as is                        -> teacher without the answer (can it be imitated?)
   reachB.parquet  the question + the reference answer and   -> teacher must FIND EVIDENCE for the answer with our
-                  an evidence-finding instruction              tools without ever searching for the answer itself
+                  an evidence-finding instruction              tools; it may search the answer only after a tool
+                                                               output has surfaced it
                                                                (is the answer reachable in our tool environment?)
     python opensearch_vl/build_reach_test.py --ids reach_ids.json --eval dev1.parquet dev2.parquet --out-dir DIR
 reach_ids.json: {"case_id": "zero16" | "control", ...}
@@ -21,8 +22,10 @@ You are told the reference answer so that you know what to look for. Your task i
 the tools, the way an agent who did not know the answer would have to: work out what the image shows (image_search
 on the image or on crops, reading text in it), then search and follow intermediate entities until a tool output
 contains the answer. Hard rules:
-- Never put the reference answer, any part of it, or a translation / spelling variant of it into a search query or
-  any other tool argument. Queries must be built only from the question, the image and earlier tool outputs.
+- Do not search for the reference answer (or any part, translation or spelling variant of it) BEFORE a tool output
+  of this conversation has surfaced it. Until then, build queries only from the question, the image and earlier
+  tool outputs. Once a tool output has shown the answer (e.g. image_search names the entity), use it freely: search
+  it to verify it or to continue to the next hop.
 - Do not stop at your own knowledge: the answer must appear in a tool output of this conversation.
 - If a query fails, change it substantially (aliases, official names, another hop, a date / place qualifier).
 - In the final <response>, give the answer and state which tool result (turn and passage) contains it. If after a
