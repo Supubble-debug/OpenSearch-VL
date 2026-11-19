@@ -9,7 +9,7 @@ Turns SFT training samples back into eval cases (question + question image(s); g
     python opensearch_vl/build_fit_check.py --new-ids /root/rl_data/v3d_final_ids.txt \
         --out /root/autodl-fs/datasets/imagentrl/eval/fit_check.parquet
 """
-import argparse, importlib.util, json, random
+import argparse, importlib.util, json, random, re
 from pathlib import Path
 
 import pandas as pd
@@ -50,7 +50,15 @@ def case(prefix, sid, s, m):
     return {"data_id": cid, "id": cid, "category": prefix, "data_source": m["source"],
             "prompt": [{"role": "user", "content": first.replace("<image>", "").strip()}],
             "images": [{"bytes": open(p, "rb").read()} for p in s["images"][:k]],
-            "answer": box[-1].strip(), "n_calls": m["n_calls"]}
+            "answer": clean(box[-1]), "n_calls": m["n_calls"]}
+
+
+def clean(ans):
+    """\\text{NBA tracking data} -> NBA tracking data (LaTeX wrappers only confuse the judge)."""
+    prev = None
+    while prev != ans:
+        prev, ans = ans, re.sub(r"\\(?:text|textbf|mathrm|mbox)\{([^{}]*)\}", r"\1", ans)
+    return ans.strip()
 
 
 rows, rep = [], {}
