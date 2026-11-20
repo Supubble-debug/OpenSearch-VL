@@ -801,6 +801,13 @@ class Qwen35SFTRunner(BaseRunner):
         with open(SFT_PROMPT_PATH, encoding="utf-8") as fh:
             prompt = json.load(fh)
         self._system = prompt["system"]
+        # Opt-in diagnosis switch (2026-11-20, crop-then-search test): append extra rules to the student's system
+        # text. Off unless STUDENT_EXTRA_RULES_FILE is set, so training/eval prompts are unchanged by default.
+        extra = os.environ.get("STUDENT_EXTRA_RULES_FILE")
+        if extra:
+            with open(extra, encoding="utf-8") as fh:
+                self._system = self._system.rstrip() + "\n\n" + fh.read().strip() + "\n"
+            logger.warning("student system prompt extended from %s", extra)
         self._tools = json.dumps(prompt["tools"], ensure_ascii=False)
 
     def load(self) -> None:

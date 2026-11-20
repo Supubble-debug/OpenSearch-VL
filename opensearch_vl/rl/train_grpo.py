@@ -182,7 +182,7 @@ class Roller:
         score = R.combine(stop, fmt, acc, hit, R.is_short_gold(gold))
         return {"data_id": row["data_id"], "k": k, "stop": stop, "fatal": stop == "fatal",
                 "fatal_turn": fatal_turn, "contents": traj.get("contents"), "n_turns": len(turns),
-                "n_tools": sum(1 for t in turns if t.get("tool_call")),
+                "n_tools": sum(1 for t in turns if t.get("tool_call")), **tool_counts(turns),
                 "judge_failed": judge_failed, **score}
 
     def run(self, rows: List[Any], n: int, outdir: str) -> Dict[str, List[Dict[str, Any]]]:
@@ -197,6 +197,26 @@ class Roller:
         return groups
 
 
+def tool_counts(turns: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Behaviour monitors (frozen RL appendix, 2026-11-20): text vs image search counts and crop-then-search.
+    A crop-then-search is an image_search whose url is not the original image (img_1)."""
+    out = {"n_text_search": 0, "n_image_search": 0, "n_crop_search": 0}
+    for t in turns:
+        try:
+            c = json.loads(t.get("tool_call") or "null") or {}
+        except ValueError:
+            c = {}
+        name = c.get("name")
+        if name in ("text_search", "web_search"):
+            out["n_text_search"] += 1
+        elif name == "image_search":
+            out["n_image_search"] += 1
+            url = str((c.get("parameters") or c.get("arguments") or {}).get("url", "")).strip()
+            if url and url != "img_1":
+                out["n_crop_search"] += 1
+    return out
+
+
 def summarize(groups: Dict[str, List[Dict[str, Any]]], prefix: str) -> Dict[str, Any]:
     flat = [r for g in groups.values() for r in g]
     if not flat:
@@ -206,6 +226,11 @@ def summarize(groups: Dict[str, List[Dict[str, Any]]], prefix: str) -> Dict[str,
     out.update({
         f"{prefix}/pass_at_n": mean([float(any(r["acc"] for r in g)) for g in groups.values()]),
         f"{prefix}/tool_calls": mean([r["n_tools"] for r in flat]),
+        f"{prefix}/text_search": mean([r.get("n_text_search", 0) for r in flat]),
+        f"{prefix}/image_search": mean([r.get("n_image_search", 0) for r in flat]),
+        f"{prefix}/share_le2_calls": mean([float(r["n_tools"] <= 2) for r in flat]),
+        f"{prefix}/share_le2_calls_wrong": mean([float(r["n_tools"] <= 2) for r in flat if not r["acc"]] or [0.0]),
+        f"{prefix}/share_crop_search": mean([float(r.get("n_crop_search", 0) > 0) for r in flat]),
         f"{prefix}/fatal_rate": stops.get("fatal", 0) / len(flat),
         f"{prefix}/max_turns_rate": stops.get("max_turns", 0) / len(flat),
         f"{prefix}/judge_failed": sum(r["judge_failed"] for r in flat),
