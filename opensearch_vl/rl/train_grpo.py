@@ -238,14 +238,17 @@ def tool_counts(turns: List[Dict[str, Any]]) -> Dict[str, int]:
     return out
 
 
-def image_probe(row: Any, state: Dict[str, Any], state_path: str) -> None:
-    """One uncached Doubao call on a real training image: the tool cache would hide a dead API
+def image_probe(rows: List[Any], state: Dict[str, Any], state_path: str) -> None:
+    """Uncached Doubao calls on real training images: the tool cache would hide a dead API
     (~95% of original images are cached), so check the live service before every step.
-    Doubao has short server-side blips (ErrorCode 500 for ~1 min, 2026-11-23), so a failed probe is
-    repeated after 30 s and 60 s; only three consecutive failures stop the run."""
+    Two failure modes are not a dead API and must not stop the run (2026-11-23):
+      * a short server-side blip (ErrorCode 500 for ~1 min) -> retried after 30 s;
+      * an image the service always rejects (~8% of images return ErrorCode 500 every time) -> a new image
+        is used for the next round.
+    Only when three DIFFERENT images all fail (with the 30 s / 60 s waits between them) is the API dead."""
     from opensearch_infer import search as S
     out = ""
-    for round_ in range(3):
+    for round_, row in enumerate(rows[:3]):
         try:
             img = list(row["images"])[0]["bytes"]
             out = S._image_search_bytes_uncached(img, attempts=2)
@@ -255,14 +258,14 @@ def image_probe(row: Any, state: Dict[str, Any], state_path: str) -> None:
             out = f"Tool execution error: probe {type(exc).__name__}"
         if str(out).lstrip().startswith("Tool execution result"):
             if round_:
-                print(f"image_search probe recovered on attempt {round_ + 1}", flush=True)
+                print(f"image_search probe recovered on image {round_ + 1}", flush=True)
             return
-        print(f"image_search probe attempt {round_ + 1}/3 failed: {str(out)[:100]!r}", flush=True)
+        print(f"image_search probe image {round_ + 1}/3 failed: {str(out)[:100]!r}", flush=True)
         if round_ < 2:
             time.sleep(30 * (round_ + 1))
     json.dump(state, open(state_path, "w"))
-    print(f"RL_STOPPED: Doubao image_search probe failed 3 times ({str(out)[:120]!r}); no rollouts made this step",
-          flush=True)
+    print(f"RL_STOPPED: Doubao image_search probe failed on 3 different images ({str(out)[:120]!r}); "
+          "no rollouts made this step", flush=True)
     raise BudgetExhausted("image_search probe failed")
 
 
@@ -560,7 +563,7 @@ def main() -> int:
                  if dev is not None and "split" in dev.columns else {})
     start_key = "evaluated_start" if state["step"] == 0 else f"evaluated_{state['step']}"
     if args.image_probe:  # also covers eval-only runs (--max-steps=-1), which never enter the step loop
-        image_probe(train.iloc[0], state, state_path)
+        image_probe([train.iloc[i] for i in range(min(3, len(train)))], state, state_path)
     if args.eval_at_start and not state.get(start_key):  # also at a resume point (baseline of the new segment)
         evaluate(state["step"])
         state[start_key] = True
@@ -583,7 +586,7 @@ def main() -> int:
         if not rows:
             break
         if args.image_probe:
-            image_probe(rows[0], state, state_path)
+            image_probe(rows, state, state_path)  # up to 3 different images from this step's batch
         outdir = os.path.join(args.run_dir, "rollouts", f"step_{step:04d}")
         groups = roller.run(rows, args.n, outdir)
         extra = 0
