@@ -100,6 +100,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--keep-adapters", type=int, default=3, help="keep the last N step adapters (+ every 5th)")
     ap.add_argument("--w-acc", type=float, default=0.8)
     ap.add_argument("--w-query", type=float, default=0.2)
+    ap.add_argument("--image-probe", type=int, default=1,
+                    help="1 = before every step, one UNCACHED Doubao image_search call; stop the run if it fails")
+    ap.add_argument("--max-image-errors", type=int, default=6,
+                    help="stop before the policy update if a step's rollouts have this many image_search errors")
     ap.add_argument("--query-signal", choices=["hit", "evidence"], default="hit",
                     help="r_query for wrong answers: string retrieval hit, or the evidence judge v2 (rl/evidence_judge.py)")
     ap.add_argument("--min-balance", type=float, default=10.0,
@@ -215,7 +219,7 @@ class Roller:
 def tool_counts(turns: List[Dict[str, Any]]) -> Dict[str, int]:
     """Behaviour monitors (frozen RL appendix, 2026-11-20): text vs image search counts and crop-then-search.
     A crop-then-search is an image_search whose url is not the original image (img_1)."""
-    out = {"n_text_search": 0, "n_image_search": 0, "n_crop_search": 0}
+    out = {"n_text_search": 0, "n_image_search": 0, "n_crop_search": 0, "n_image_err": 0}
     for t in turns:
         try:
             c = json.loads(t.get("tool_call") or "null") or {}
@@ -226,10 +230,30 @@ def tool_counts(turns: List[Dict[str, Any]]) -> Dict[str, int]:
             out["n_text_search"] += 1
         elif name == "image_search":
             out["n_image_search"] += 1
+            if str(t.get("tool_output") or "").lstrip().startswith("Tool execution error"):
+                out["n_image_err"] += 1
             url = str((c.get("parameters") or c.get("arguments") or {}).get("url", "")).strip()
             if url and url != "img_1":
                 out["n_crop_search"] += 1
     return out
+
+
+def image_probe(row: Any, state: Dict[str, Any], state_path: str) -> None:
+    """One uncached Doubao call on a real training image: the tool cache would hide a dead API
+    (~95% of original images are cached), so check the live service before every step."""
+    from opensearch_infer import search as S
+    try:
+        img = list(row["images"])[0]["bytes"]
+        out = S._image_search_bytes_uncached(img, attempts=3)
+    except S.FatalServiceError as exc:
+        out = f"Tool execution error: {exc}"
+    except Exception as exc:  # noqa: BLE001 - any failure here means we cannot trust image search
+        out = f"Tool execution error: probe {type(exc).__name__}"
+    if not str(out).lstrip().startswith("Tool execution result"):
+        json.dump(state, open(state_path, "w"))
+        print(f"RL_STOPPED: Doubao image_search probe failed ({str(out)[:120]!r}); no rollouts made for this step",
+              flush=True)
+        raise BudgetExhausted("image_search probe failed")
 
 
 def summarize(groups: Dict[str, List[Dict[str, Any]]], prefix: str) -> Dict[str, Any]:
@@ -249,6 +273,7 @@ def summarize(groups: Dict[str, List[Dict[str, Any]]], prefix: str) -> Dict[str,
         f"{prefix}/fatal_rate": stops.get("fatal", 0) / len(flat),
         f"{prefix}/max_turns_rate": stops.get("max_turns", 0) / len(flat),
         f"{prefix}/judge_failed": sum(r["judge_failed"] for r in flat),
+        f"{prefix}/image_search_errors": sum(r.get("n_image_err", 0) for r in flat),
         f"{prefix}/hit_str": mean([r.get("hit_str", 0) for r in flat]),
         f"{prefix}/ev_called": sum(bool(r.get("ev_called")) for r in flat),
         f"{prefix}/ev_failed": sum(bool(r.get("ev_failed")) for r in flat),
@@ -524,6 +549,8 @@ def main() -> int:
     dev_split = ({str(a): str(b) for a, b in zip(dev["data_id"], dev["split"])}
                  if dev is not None and "split" in dev.columns else {})
     start_key = "evaluated_start" if state["step"] == 0 else f"evaluated_{state['step']}"
+    if args.image_probe:  # also covers eval-only runs (--max-steps=-1), which never enter the step loop
+        image_probe(train.iloc[0], state, state_path)
     if args.eval_at_start and not state.get(start_key):  # also at a resume point (baseline of the new segment)
         evaluate(state["step"])
         state[start_key] = True
@@ -545,6 +572,8 @@ def main() -> int:
         rows = next_rows(args.prompts_per_step)
         if not rows:
             break
+        if args.image_probe:
+            image_probe(rows[0], state, state_path)
         outdir = os.path.join(args.run_dir, "rollouts", f"step_{step:04d}")
         groups = roller.run(rows, args.n, outdir)
         extra = 0
@@ -576,6 +605,11 @@ def main() -> int:
             "train/fatal_in_samples": sum(1 for s in samples if s["fatal"]),
         })
         flat = [r for g in groups.values() for r in g]
+        n_img_err = sum(r.get("n_image_err", 0) for r in flat)
+        if args.max_image_errors and n_img_err >= args.max_image_errors:
+            print(f"RL_STOPPED: {n_img_err} image_search errors in step {step} rollouts (Doubao down or quota out?); "
+                  "no update made for this step", flush=True)
+            raise BudgetExhausted(f"image_search errors {n_img_err}")
         fail_rate = (sum(r["judge_failed"] for r in flat) / len(flat)) if flat else 0.0
         if fail_rate > args.max_judge_fail_rate:
             print(f"RL_STOPPED: judge unanswered on {fail_rate:.0%} of rollouts (balance {balance:.2f})", flush=True)
