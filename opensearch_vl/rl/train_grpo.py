@@ -240,20 +240,30 @@ def tool_counts(turns: List[Dict[str, Any]]) -> Dict[str, int]:
 
 def image_probe(row: Any, state: Dict[str, Any], state_path: str) -> None:
     """One uncached Doubao call on a real training image: the tool cache would hide a dead API
-    (~95% of original images are cached), so check the live service before every step."""
+    (~95% of original images are cached), so check the live service before every step.
+    Doubao has short server-side blips (ErrorCode 500 for ~1 min, 2026-11-23), so a failed probe is
+    repeated after 30 s and 60 s; only three consecutive failures stop the run."""
     from opensearch_infer import search as S
-    try:
-        img = list(row["images"])[0]["bytes"]
-        out = S._image_search_bytes_uncached(img, attempts=3)
-    except S.FatalServiceError as exc:
-        out = f"Tool execution error: {exc}"
-    except Exception as exc:  # noqa: BLE001 - any failure here means we cannot trust image search
-        out = f"Tool execution error: probe {type(exc).__name__}"
-    if not str(out).lstrip().startswith("Tool execution result"):
-        json.dump(state, open(state_path, "w"))
-        print(f"RL_STOPPED: Doubao image_search probe failed ({str(out)[:120]!r}); no rollouts made for this step",
-              flush=True)
-        raise BudgetExhausted("image_search probe failed")
+    out = ""
+    for round_ in range(3):
+        try:
+            img = list(row["images"])[0]["bytes"]
+            out = S._image_search_bytes_uncached(img, attempts=2)
+        except S.FatalServiceError as exc:
+            out = f"Tool execution error: {exc}"
+        except Exception as exc:  # noqa: BLE001 - any failure here means we cannot trust image search
+            out = f"Tool execution error: probe {type(exc).__name__}"
+        if str(out).lstrip().startswith("Tool execution result"):
+            if round_:
+                print(f"image_search probe recovered on attempt {round_ + 1}", flush=True)
+            return
+        print(f"image_search probe attempt {round_ + 1}/3 failed: {str(out)[:100]!r}", flush=True)
+        if round_ < 2:
+            time.sleep(30 * (round_ + 1))
+    json.dump(state, open(state_path, "w"))
+    print(f"RL_STOPPED: Doubao image_search probe failed 3 times ({str(out)[:120]!r}); no rollouts made this step",
+          flush=True)
+    raise BudgetExhausted("image_search probe failed")
 
 
 def summarize(groups: Dict[str, List[Dict[str, Any]]], prefix: str) -> Dict[str, Any]:
