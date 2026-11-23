@@ -347,8 +347,15 @@ class Policy:
                 images = images[:-n_img]
         if not msgs:
             return None
-        rendered = rn._template.mm_plugin.process_messages(msgs, images, [], [], rn._processor)
-        pairs = rn._template.encode_multiturn(rn._tokenizer, rendered, rn._system, rn._tools)
+        try:
+            rendered = rn._template.mm_plugin.process_messages(msgs, images, [], [], rn._processor)
+            pairs = rn._template.encode_multiturn(rn._tokenizer, rendered, rn._system, rn._tools)
+        except ValueError as exc:
+            # A rollout whose contents disagree with its images (e.g. the image count and the <image>
+            # tokens differ) must not kill the run: skip that one sample.  Seen 2026-11-23 (step 36).
+            log.warning("encode skipped, malformed sample: %s", str(exc)[:200])
+            self.enc_bad = getattr(self, "enc_bad", 0) + 1
+            return None
         ids: List[int] = []
         mask: List[int] = []
         for turn, (p, r) in enumerate(pairs):
@@ -456,6 +463,7 @@ class Policy:
         self.opt.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
         return {"train/seqs": len(idx), "train/skipped": skipped, "train/tokens": tokens,
+                "train/encode_bad": getattr(self, "enc_bad", 0),
                 "train/opt_steps": n_opt, "train/grad_norm": mean(gnorms), "train/grad_norm_max": max(gnorms or [0.0]),
                 "train/mean_logp": mean([float(old[i].mean()) for i in idx]),
                 "train/clip_frac": mean(clipfr), "train/approx_kl_bf16": mean(kl_approx),
