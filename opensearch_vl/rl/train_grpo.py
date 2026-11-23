@@ -51,6 +51,7 @@ from opensearch_infer import config, pipeline  # noqa: E402
 from opensearch_infer.runners import InferenceConfig, build_runner  # noqa: E402
 from opensearch_infer.search import FatalServiceError  # noqa: E402
 from rl import reward as R  # noqa: E402
+from rl import evidence_judge as EJ  # noqa: E402
 
 log = logging.getLogger("grpo")
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
@@ -99,6 +100,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--keep-adapters", type=int, default=3, help="keep the last N step adapters (+ every 5th)")
     ap.add_argument("--w-acc", type=float, default=0.8)
     ap.add_argument("--w-query", type=float, default=0.2)
+    ap.add_argument("--query-signal", choices=["hit", "evidence"], default="hit",
+                    help="r_query for wrong answers: string retrieval hit, or the evidence judge v2 (rl/evidence_judge.py)")
     ap.add_argument("--min-balance", type=float, default=10.0,
                     help="DeepSeek credit (CNY) below which the run stops before the next step")
     ap.add_argument("--max-judge-fail-rate", type=float, default=0.25,
@@ -155,7 +158,7 @@ class Roller:
         judge.STRICT = True
         self.stop = threading.Event()
 
-    def one(self, row: Any, idx: int, k: int, outdir: str) -> Dict[str, Any]:
+    def one(self, row: Any, idx: int, k: int, outdir: str, evidence: bool = True) -> Dict[str, Any]:
         if self.stop.is_set():
             return {"skipped": True}
         try:
@@ -178,18 +181,30 @@ class Roller:
             final = "\n\n".join(t.get("response_text", "") for t in turns if t.get("response_text"))
             res = judge.judge_common(question, R.judge_gold(gold, aliases), judge.extract_final_answer(final))
             acc, judge_failed = int(res["acc"]), bool(res.get("judge_failed"))
-        hit = R.retrieval_hit(turns, gold, aliases)
-        score = R.combine(stop, fmt, acc, hit, R.is_short_gold(gold))
+        hit_str = R.retrieval_hit(turns, gold, aliases)
+        hit, ev_called, ev_failed = hit_str, False, False
+        short = R.is_short_gold(gold)
+        # Evidence judge only where it can change the reward: answered, wrong, non-short gold
+        # (correct answers get query = 1; short golds use acc; unanswered rollouts get 0).
+        if evidence and self.args.query_signal == "evidence" and stop == "response" and not acc and not judge_failed and not short:
+            ev_called = True
+            ev = EJ.judge(row["prompt"][0]["content"], R.judge_gold(gold, aliases), turns)
+            if ev is None:
+                ev_failed, judge_failed, hit = True, True, 0  # the group is dropped, as for answer-judge failures
+            else:
+                hit = int(ev)
+        score = R.combine(stop, fmt, acc, hit, short)
         return {"data_id": row["data_id"], "k": k, "stop": stop, "fatal": stop == "fatal",
                 "fatal_turn": fatal_turn, "contents": traj.get("contents"), "n_turns": len(turns),
                 "n_tools": sum(1 for t in turns if t.get("tool_call")), **tool_counts(turns),
-                "judge_failed": judge_failed, **score}
+                "judge_failed": judge_failed, "hit_str": hit_str, "ev_called": ev_called, "ev_failed": ev_failed,
+                **score}
 
-    def run(self, rows: List[Any], n: int, outdir: str) -> Dict[str, List[Dict[str, Any]]]:
+    def run(self, rows: List[Any], n: int, outdir: str, evidence: bool = True) -> Dict[str, List[Dict[str, Any]]]:
         jobs = [(row, i, k) for i, row in enumerate(rows) for k in range(n)]
         groups: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
         with ThreadPoolExecutor(self.args.workers) as ex:
-            futs = [ex.submit(self.one, row, i, k, outdir) for row, i, k in jobs]
+            futs = [ex.submit(self.one, row, i, k, outdir, evidence) for row, i, k in jobs]
             for f in futs:
                 r = f.result()  # re-raises FatalServiceError
                 if not r.get("skipped"):
@@ -234,6 +249,10 @@ def summarize(groups: Dict[str, List[Dict[str, Any]]], prefix: str) -> Dict[str,
         f"{prefix}/fatal_rate": stops.get("fatal", 0) / len(flat),
         f"{prefix}/max_turns_rate": stops.get("max_turns", 0) / len(flat),
         f"{prefix}/judge_failed": sum(r["judge_failed"] for r in flat),
+        f"{prefix}/hit_str": mean([r.get("hit_str", 0) for r in flat]),
+        f"{prefix}/ev_called": sum(bool(r.get("ev_called")) for r in flat),
+        f"{prefix}/ev_failed": sum(bool(r.get("ev_failed")) for r in flat),
+        f"{prefix}/ev_yes_rate": mean([float(r["hit"]) for r in flat if r.get("ev_called") and not r.get("ev_failed")]),
         f"{prefix}/rollouts": len(flat),
         f"{prefix}/stops": dict(stops),
     })
@@ -494,7 +513,7 @@ def main() -> int:
         t0 = time.time()
         rows = [dev.iloc[i] for i in range(len(dev))]
         outdir = os.path.join(args.run_dir, "dev", f"step_{step:04d}")
-        groups = roller.run(rows, args.dev_n, outdir)
+        groups = roller.run(rows, args.dev_n, outdir, evidence=False)  # dev = accuracy only
         out = {**summarize(groups, "dev"), "dev/time_min": (time.time() - t0) / 60}
         for sp in sorted(set(dev_split.values())):  # e.g. dev (85 audited) / val (held-out train q)
             out.update(summarize({q: g for q, g in groups.items() if dev_split.get(q) == sp}, f"dev_{sp}"))

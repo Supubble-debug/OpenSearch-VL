@@ -2,7 +2,7 @@
 # Agentic GRPO/RLOO with LoRA (rl/train_grpo.py) on 2 GPUs:
 #   GPU 0: vLLM token server (policy, per-request LoRA) + the trainer (HF + PEFT)
 #   GPU 1: local 27B summariser for search results
-# DeepSeek: text search + strict judge; Doubao: image search.
+# DeepSeek: text search; Bailian DeepSeek: strict answer judge + evidence judge (RL_JUDGE); Doubao: image search.
 #   bash opensearch_vl/run_rl.sh <run_name> [extra train_grpo.py args...]
 # Env: RL_MODEL, RL_TRAIN, RL_DEV, VLLM_MEM (0.40), MIN_DEEPSEEK_CNY (30). Re-running resumes.
 # RL_ENTRY: another script taking the same --model/--train/--dev/--run-dir/--metrics/--max-turns
@@ -22,6 +22,14 @@ SECRETS=/root/.imagentrl-secrets.env
 [ -f "$SECRETS" ] || { echo "ERROR: $SECRETS missing"; exit 1; }
 set -a; . "$SECRETS"; set +a
 : "${OUTPUT_ROOT:?OUTPUT_ROOT must be set}"
+# Answer judge (r_acc) and the evidence judge (--query-signal evidence): Bailian DeepSeek, the same judge model as the
+# frozen eval protocol (2026-11-22). RL_JUDGE=deepseek restores the official DeepSeek judge from the secrets file.
+if [ "${RL_JUDGE:-bailian}" = bailian ]; then
+  : "${BAILIAN_API_BASE:?BAILIAN_API_BASE missing}" "${BAILIAN_API_KEY:?BAILIAN_API_KEY missing}"
+  export JUDGE_API_BASE_URL=$BAILIAN_API_BASE JUDGE_API_KEY=$BAILIAN_API_KEY JUDGE_MODEL=deepseek-v4.1-flash-1017
+  export LLM_EXTRA_BODY_JSON='{"thinking": {"type": "disabled"}}'
+fi
+echo "answer judge: $JUDGE_MODEL @ $JUDGE_API_BASE_URL"
 mkdir -p "$RUN"
 export TOOL_CACHE_DB=$RUN/tool_cache.sqlite
 
