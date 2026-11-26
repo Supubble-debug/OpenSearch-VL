@@ -50,6 +50,12 @@ def judge_gold(gold: str, aliases: List[str]) -> str:
     return gold + (f" (also acceptable: {'; '.join(aliases)})" if aliases else "")
 
 
+def is_yesno_gold(gold: str) -> bool:
+    p = parts(gold)
+    total = "".join(p)
+    return (not p) or total in _YESNO
+
+
 def is_short_gold(gold: str) -> bool:
     p = parts(gold)
     total = "".join(p)

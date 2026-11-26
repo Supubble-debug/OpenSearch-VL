@@ -84,6 +84,19 @@ _summary_extra = os.environ.get("SUMMARY_EXTRA_BODY_JSON")
 SUMMARY_EXTRA_BODY: Optional[Dict[str, object]] = (
     json.loads(_summary_extra) if _summary_extra else None
 )
+VALID_SUMMARY_VERSIONS = frozenset({"v1", "v3.1"})
+SUMMARY_VERSION: str = os.environ.get("SUMMARY_VERSION", "v1").strip().lower() or "v1"
+
+
+def get_summary_version() -> str:
+    """Return the active text-search summariser version ('v1' or 'v3.1')."""
+    val = os.environ.get("SUMMARY_VERSION")
+    ver = (val if val is not None and val.strip() else SUMMARY_VERSION).strip().lower() or "v1"
+    if ver not in VALID_SUMMARY_VERSIONS:
+        raise ValueError(
+            f"Unsupported SUMMARY_VERSION={ver!r}; expected one of {sorted(VALID_SUMMARY_VERSIONS)}"
+        )
+    return ver
 
 
 # ---------------------------------------------------------------------------

@@ -23,9 +23,11 @@ import json
 import logging
 import os
 import re
+import sqlite3
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
 from PIL import Image
@@ -162,6 +164,37 @@ def layout_parsing(
 # Summarisation backbone
 # ---------------------------------------------------------------------------
 
+_QUESTION_TLS = threading.local()
+
+V3_100W_PROMPT = """Summarise the webpage below into dense, strictly neutral factual notes.
+
+Search Query: {query}
+Attribute/Unit Hint (from an unseen image question — DO NOT answer it or guess image identity): {q}
+Webpage Title: {title}
+
+Webpage Content:
+{content}
+
+Rules:
+1. Neutral facts ONLY: State ONLY facts explicitly written on this page. NEVER draw conclusions or rankings (do NOT decide which item is "highest", "closest", "farthest", or "the answer"), NEVER guess who or what "this person / animal / building / object" in the hint refers to, and NEVER add disclaimers about missing info (do NOT write "the page does not mention/confirm..." or "cannot answer...").
+2. Preserve exact specifics: Keep exact proper nouns, model/SKU numbers, quantities with exact units (including any side-by-side variant/model numbers mentioned), exact dates, and historical names or aliases relevant to the Search Query or the attributes/units in the hint.
+   - Taxa: write the complete taxonomic lineage inline (Kingdom > ... > Species, including ALL unranked clades, superfamilies, subfamilies) PLUS any listed taxonomic synonyms, basionyms, or former genera.
+   - Lists (occupants, tenants, products, buildings/wings, people, works, variants): list ALL specific named entities compactly instead of replacing them with generic words ("various museums") or partial examples.
+3. Strict length: 3-5 dense sentences, 60-100 words (HARD LIMIT: <= 105 words). Start directly with the subject and facts—no meta-prefaces ("This webpage...", "Based on..."), no bullet lists, no repetition.
+4. Only if the entire page is completely unrelated to the Search Query, write one short sentence (< 20 words) stating the page's actual topic.
+
+Factual notes:"""
+
+
+def set_current_question(question: str) -> None:
+    """Store the active case's cleaned question in thread-local storage (used by v3.1)."""
+    _QUESTION_TLS.question = (question or "").strip()
+
+
+def get_current_question() -> str:
+    """Return the active case's cleaned question for the current thread."""
+    return getattr(_QUESTION_TLS, "question", "")
+
 
 def _summary_payload(prompt: str) -> Dict[str, object]:
     payload: Dict[str, object] = {
@@ -184,6 +217,19 @@ def _summary_payload(prompt: str) -> Dict[str, object]:
     return payload
 
 
+def _summary_payload_v3(prompt: str) -> Dict[str, object]:
+    """Fixed v3.1 summariser payload (immune to external SUMMARY_EXTRA_BODY_JSON)."""
+    return {
+        "model": config.QWEN_MODEL_NAME,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 280,
+        "temperature": 0.3,
+        "top_p": 0.95,
+        "top_k": 20,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+
 def _summary_headers() -> Dict[str, str]:
     headers = {"Content-Type": "application/json"}
     if config.QWEN_API_KEY:
@@ -191,8 +237,57 @@ def _summary_headers() -> Dict[str, str]:
     return headers
 
 
+def _summarize_v3(
+    content: str, query: str, title: str, question: str
+) -> Tuple[str, bool]:
+    """Generate a v3.1 neutral compact factual summary for a single page."""
+    prompt = V3_100W_PROMPT.format(
+        q=question,
+        query=query,
+        title=title or "",
+        content=content[: config.SUMMARY_CONTENT_MAX_CHARS],
+    )
+    payload = _summary_payload_v3(prompt)
+    last_err: Optional[str] = None
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                f"{config.QWEN_API_BASE.rstrip('/')}/chat/completions",
+                headers=_summary_headers(),
+                json=payload,
+                timeout=90,
+            )
+            _raise_if_fatal("summariser", response.status_code)
+            if response.status_code == 200:
+                choices = response.json().get("choices", [])
+                if choices:
+                    summary = (
+                        choices[0].get("message", {}).get("content") or ""
+                    ).strip()
+                    if summary:
+                        return summary, True
+            last_err = f"HTTP {response.status_code}: {response.text[:160]}"
+        except FatalServiceError:
+            raise
+        except Exception as exc:
+            last_err = str(exc)
+        if attempt < 2:
+            time.sleep(1.5 * (attempt + 1))
+    logger.warning("v3.1 summarization failed after 3 attempts: %s", last_err)
+    return content[:500] + ("..." if len(content) > 500 else ""), False
+
+
 def summarize_with_qwen(content: str, query: str, title: str) -> str:
     """Generate a short, query-focused summary for a single page."""
+
+    if config.get_summary_version() == "v3.1":
+        summary, _ = _summarize_v3(
+            content=content,
+            query=query,
+            title=title,
+            question=get_current_question(),
+        )
+        return summary
 
     prompt = (
         f"Based on the following webpage content, provide a concise summary "
@@ -438,11 +533,113 @@ def _deepseek_fetch(url: str) -> str:
     return (response.json().get("content") or "").strip()
 
 
+def _lookup_saved_raw(query: str, top_k: int) -> Optional[List[dict]]:
+    path = os.environ.get("RAW_LOG_DB")
+    if not path or not os.path.exists(path):
+        return None
+    con: Optional[sqlite3.Connection] = None
+    try:
+        con = sqlite3.connect(path, timeout=30)
+        row = con.execute(
+            "SELECT v FROM raw WHERE q=? AND top_k=? LIMIT 1",
+            (query.strip(), int(top_k)),
+        ).fetchone()
+        if row:
+            pages = json.loads(row[0])
+            if isinstance(pages, list) and pages:
+                return pages
+    except Exception:
+        pass
+    finally:
+        if con is not None:
+            con.close()
+    return None
+
+
 def _text_search_deepseek(query: str, top_k: int) -> str:
     """DeepSeek Search -> page text (search index, else Fetch) -> summaries."""
     top_k = max(1, min(int(top_k), 10))
+    if config.get_summary_version() == "v3.1":
+        question = get_current_question()
+        k = tool_cache.key("text_search_v3_100w", query.strip(), top_k, question)
+        return tool_cache.cached(
+            "text_search_v3_100w",
+            k,
+            lambda: _text_search_deepseek_v3_uncached(query, top_k, question),
+        )
     k = tool_cache.key("text_search", query.strip(), top_k, config.QWEN_MODEL_NAME)
     return tool_cache.cached("text_search", k, lambda: _text_search_deepseek_uncached(query, top_k))
+
+
+def _text_search_deepseek_v3_uncached(query: str, top_k: int, question: str) -> str:
+    saved = _lookup_saved_raw(query, top_k)
+    from_saved = saved is not None
+    if from_saved:
+        results = saved[:top_k]
+    else:
+        payload = {
+            "query": query.strip()[:_DEEPSEEK_QUERY_MAX_CHARS],
+            "count": top_k,
+            "need_content": True,
+        }
+        try:
+            response = _post_with_retries(
+                f"{config.DEEPSEEK_API_BASE}/v1/tools/search", _deepseek_headers(), payload
+            )
+        except requests.RequestException as exc:
+            return f"Tool execution error:\nText search failed: {exc}"
+        if response is not None:
+            _raise_if_fatal("DeepSeek Search", response.status_code)
+        if response is None or response.status_code != 200:
+            code = None if response is None else response.status_code
+            return f"Tool execution error:\nText search failed: HTTP {code}"
+        results = (response.json().get("results") or [])[:top_k]
+        if not results:
+            return "Tool execution result:\nNo relevant web pages found for the query."
+
+    def one(item: dict) -> Tuple[str, str, bool]:
+        url, title = item.get("url", ""), item.get("title", "")
+        content = (item.get("content") or "").strip()
+        if not content and url and not from_saved:
+            content = _deepseek_fetch(url)
+        if not content:
+            content = item.get("summary") or item.get("snippet") or ""
+        s, ok = _summarize_v3(
+            content=content, query=query, title=title, question=question
+        )
+        return content, s, ok
+
+    with ThreadPoolExecutor(max_workers=len(results)) as pool:
+        triples = list(pool.map(one, results))
+    summaries = [s for _, s, _ in triples]
+    ok_count = sum(1 for _, _, ok in triples if ok)
+    if ok_count == 0:
+        return "Tool execution error:\nLocal 27B summariser failed for all passages."
+
+    if not from_saved:
+        tool_cache.log_raw(
+            query.strip(),
+            top_k,
+            [
+                {
+                    "url": it.get("url", ""),
+                    "title": it.get("title", ""),
+                    "content": c[:15000],
+                    "summary": s,
+                }
+                for it, (c, s, _) in zip(results, triples)
+            ],
+        )
+
+    out = "Tool execution result:\n\n"
+    for idx, (item, summary) in enumerate(zip(results, summaries), start=1):
+        out += (
+            f"\n{'=' * 60}[Passage {idx}]\n"
+            f"Title: {item.get('title', '')}\n"
+            f"URL: {item.get('url', '')}\n"
+            f"Summary:\n{summary}\n"
+        )
+    return out
 
 
 def _text_search_deepseek_uncached(query: str, top_k: int) -> str:

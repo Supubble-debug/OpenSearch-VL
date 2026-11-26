@@ -12,12 +12,25 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 import numpy as np
 from PIL import Image
 
-from . import config, image_io, tools
+from . import config, image_io, search, tools
 from .runners import BaseRunner, InferenceConfig
 from .prompts import SYSTEM_PROMPT
 
 
 logger = logging.getLogger(__name__)
+
+_PRIVILEGED_MARKER = "[PRIVILEGED REFERENCE ANSWER"
+_HINT_MARKER = "[HINT - for this run only]"
+
+
+def _clean_question(prompt_text: str) -> str:
+    """Strip privileged reference and per-run hint suffixes for v3.1 summarisation."""
+    return (
+        (prompt_text or "")
+        .split(_PRIVILEGED_MARKER)[0]
+        .split(_HINT_MARKER)[0]
+        .strip()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -277,112 +290,138 @@ def process_single_case(
     cfg = inference_cfg or InferenceConfig()
     consecutive_errors = 0
 
-    for turn_num in range(config.MAX_TURNS):
-        try:
-            response = runner.infer(
-                contents=gemini_contents,
-                system_instruction=SYSTEM_PROMPT,
-                cfg=cfg,
-            )
-        except Exception as exc:
-            logger.error("Inference failed on turn %d: %s", turn_num, exc, exc_info=True)
-            trajectory["turns"].append({"turn": turn_num, "error": str(exc)})
-            trajectory["stop_reason"] = "runner_exception"
-            break
+    prev_question = search.get_current_question()
+    search.set_current_question(_clean_question(prompt_text))
+    try:
+        for turn_num in range(config.MAX_TURNS):
+            try:
+                response = runner.infer(
+                    contents=gemini_contents,
+                    system_instruction=SYSTEM_PROMPT,
+                    cfg=cfg,
+                )
+            except Exception as exc:
+                logger.error("Inference failed on turn %d: %s", turn_num, exc, exc_info=True)
+                trajectory["turns"].append({"turn": turn_num, "error": str(exc)})
+                trajectory["stop_reason"] = "runner_exception"
+                break
 
-        response_text = ""
-        for cand in response.get("candidates", []) or []:
-            for part in cand.get("content", {}).get("parts", []):
-                if "text" in part:
-                    response_text += part["text"]
+            response_text = ""
+            for cand in response.get("candidates", []) or []:
+                for part in cand.get("content", {}).get("parts", []):
+                    if "text" in part:
+                        response_text += part["text"]
 
-        turn_record: Dict[str, Any] = {
-            "turn": turn_num,
-            "response": response,
-            "response_text": response_text,
-        }
-        trajectory["turns"].append(turn_record)
+            turn_record: Dict[str, Any] = {
+                "turn": turn_num,
+                "response": response,
+                "response_text": response_text,
+            }
+            trajectory["turns"].append(turn_record)
 
-        candidates = response.get("candidates", []) or []
-        if candidates:
-            gemini_contents.append(
-                {
-                    "role": "model",
-                    "parts": candidates[0].get("content", {}).get("parts", []),
-                }
-            )
+            candidates = response.get("candidates", []) or []
+            if candidates:
+                gemini_contents.append(
+                    {
+                        "role": "model",
+                        "parts": candidates[0].get("content", {}).get("parts", []),
+                    }
+                )
 
-        finish = (candidates[0].get("finishReason") if candidates else None) or ""
-        if finish == "ERROR":
-            # A prompt outgrowing the context is the agent's outcome, not a crash.
-            trajectory["stop_reason"] = (
-                "context_limit" if "context_limit" in response_text else "runner_error"
-            )
-            break
+            finish = (candidates[0].get("finishReason") if candidates else None) or ""
+            if finish == "ERROR":
+                # A prompt outgrowing the context is the agent's outcome, not a crash.
+                trajectory["stop_reason"] = (
+                    "context_limit" if "context_limit" in response_text else "runner_error"
+                )
+                break
 
-        if tools.has_response_tag(response_text):
-            trajectory["stop_reason"] = "response"
-            break
+            if tools.has_response_tag(response_text):
+                trajectory["stop_reason"] = "response"
+                break
 
-        tool_call_json = tools.extract_tool_call(response_text)
-        if not tool_call_json:
-            logger.info("Turn %d ended without tool call or response tag.", turn_num)
-            trajectory["stop_reason"] = (
-                "max_tokens" if finish == "MAX_TOKENS" else "no_tool_call"
-            )
-            break
+            tool_call_json = tools.extract_tool_call(response_text)
+            if not tool_call_json:
+                logger.info("Turn %d ended without tool call or response tag.", turn_num)
+                trajectory["stop_reason"] = (
+                    "max_tokens" if finish == "MAX_TOKENS" else "no_tool_call"
+                )
+                break
 
-        os.makedirs(intermediate_dir, exist_ok=True)
-        # A bad tool call is the agent's error to recover from, not a lost case.
-        try:
-            tool_message, new_images = tools.execute_tool(
-                tool_call_json,
-                image_paths_dict,
-                case_id,
-                case_idx,
-                turn_num,
-                intermediate_dir,
-                filename_prefix=filename_prefix,
-                visual_lookup=visual_lookup,
-            )
-        except tools.search.FatalServiceError:
-            raise  # no trajectory is written, so a resumed run redoes this case
-        except Exception as exc:
-            logger.warning("Tool failed on turn %d: %s", turn_num, exc)
-            tool_message = f"Tool execution error:\n{type(exc).__name__}: {exc}"
-            new_images = {}
-        turn_record["tool_call"] = tool_call_json
-        observation_text = f"<observation>\n{tool_message}\n</observation>"
-        turn_record["tool_output"] = observation_text
-        tool_error = str(tool_message).lstrip().startswith("Tool execution error")
-        turn_record["tool_error"] = tool_error
-        consecutive_errors = consecutive_errors + 1 if tool_error else 0
-        if fatal_consecutive_errors and consecutive_errors >= fatal_consecutive_errors:
-            trajectory["stop_reason"] = "fatal"
-            trajectory["fatal_turn"] = turn_num
-            gemini_contents.append({"role": "user", "parts": [{"text": observation_text}]})
-            break
+            os.makedirs(intermediate_dir, exist_ok=True)
+            # A bad tool call is the agent's error to recover from, not a lost case.
+            try:
+                tool_message, new_images = tools.execute_tool(
+                    tool_call_json,
+                    image_paths_dict,
+                    case_id,
+                    case_idx,
+                    turn_num,
+                    intermediate_dir,
+                    filename_prefix=filename_prefix,
+                    visual_lookup=visual_lookup,
+                )
+            except tools.search.FatalServiceError:
+                raise  # no trajectory is written, so a resumed run redoes this case
+            except Exception as exc:
+                logger.warning("Tool failed on turn %d: %s", turn_num, exc)
+                tool_message = f"Tool execution error:\n{type(exc).__name__}: {exc}"
+                new_images = {}
+            turn_record["tool_call"] = tool_call_json
+            observation_text = f"<observation>\n{tool_message}\n</observation>"
+            turn_record["tool_output"] = observation_text
+            tool_error = str(tool_message).lstrip().startswith("Tool execution error")
+            turn_record["tool_error"] = tool_error
+            consecutive_errors = consecutive_errors + 1 if tool_error else 0
+            if fatal_consecutive_errors and consecutive_errors >= fatal_consecutive_errors:
+                trajectory["stop_reason"] = "fatal"
+                trajectory["fatal_turn"] = turn_num
+                gemini_contents.append({"role": "user", "parts": [{"text": observation_text}]})
+                break
 
-        if new_images:
-            for new_id, payload in new_images.items():
-                image_paths_dict[new_id] = payload
-                if isinstance(payload, str) and payload.startswith(
-                    ("http://", "https://")
-                ):
-                    gemini_contents.append(
-                        {
-                            "role": "user",
-                            "parts": [
-                                {"text": observation_text},
-                                {"image_url": {"url": payload}},
-                            ],
-                        }
-                    )
-                elif isinstance(payload, str) and os.path.exists(payload):
-                    try:
-                        with open(payload, "rb") as fh:
-                            data = fh.read()
-                        encoded = image_io.image_to_base64(data) or ""
+            if new_images:
+                for new_id, payload in new_images.items():
+                    image_paths_dict[new_id] = payload
+                    if isinstance(payload, str) and payload.startswith(
+                        ("http://", "https://")
+                    ):
+                        gemini_contents.append(
+                            {
+                                "role": "user",
+                                "parts": [
+                                    {"text": observation_text},
+                                    {"image_url": {"url": payload}},
+                                ],
+                            }
+                        )
+                    elif isinstance(payload, str) and os.path.exists(payload):
+                        try:
+                            with open(payload, "rb") as fh:
+                                data = fh.read()
+                            encoded = image_io.image_to_base64(data) or ""
+                            gemini_contents.append(
+                                {
+                                    "role": "user",
+                                    "parts": [
+                                        {"text": observation_text},
+                                        {
+                                            "inline_data": {
+                                                "mime_type": image_io.detect_image_format(
+                                                    encoded
+                                                ),
+                                                "data": encoded,
+                                            }
+                                        },
+                                    ],
+                                }
+                            )
+                        except OSError as exc:
+                            logger.warning("Cannot read intermediate image %s: %s", payload, exc)
+                            gemini_contents.append(
+                                {"role": "user", "parts": [{"text": observation_text}]}
+                            )
+                    elif isinstance(payload, bytes):
+                        encoded = image_io.image_to_base64(payload) or ""
                         gemini_contents.append(
                             {
                                 "role": "user",
@@ -399,37 +438,16 @@ def process_single_case(
                                 ],
                             }
                         )
-                    except OSError as exc:
-                        logger.warning("Cannot read intermediate image %s: %s", payload, exc)
+                    else:
                         gemini_contents.append(
                             {"role": "user", "parts": [{"text": observation_text}]}
                         )
-                elif isinstance(payload, bytes):
-                    encoded = image_io.image_to_base64(payload) or ""
-                    gemini_contents.append(
-                        {
-                            "role": "user",
-                            "parts": [
-                                {"text": observation_text},
-                                {
-                                    "inline_data": {
-                                        "mime_type": image_io.detect_image_format(
-                                            encoded
-                                        ),
-                                        "data": encoded,
-                                    }
-                                },
-                            ],
-                        }
-                    )
-                else:
-                    gemini_contents.append(
-                        {"role": "user", "parts": [{"text": observation_text}]}
-                    )
-        else:
-            gemini_contents.append(
-                {"role": "user", "parts": [{"text": observation_text}]}
-            )
+            else:
+                gemini_contents.append(
+                    {"role": "user", "parts": [{"text": observation_text}]}
+                )
+    finally:
+        search.set_current_question(prev_question)
 
     # Trajectory writeout
     trajectory["final_response_text"] = "\n\n".join(

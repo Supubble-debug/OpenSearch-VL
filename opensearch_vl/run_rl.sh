@@ -61,8 +61,21 @@ done
 # Summariser = local 27B (never DeepSeek: one call per fetched page would multiply the bill).
 export QWEN_API_BASE=http://127.0.0.1:8000/v1 QWEN_MODEL=summariser QWEN_MODEL_NAME=summariser QWEN_API_KEY=
 export SUMMARY_EXTRA_BODY_JSON='{"top_p": 0.8, "top_k": 20, "chat_template_kwargs": {"enable_thinking": false}}'
+export SUMMARY_VERSION=${SUMMARY_VERSION:-v1}
 case "$QWEN_API_BASE" in http://127.0.0.1*) ;; *) echo "ERROR: summariser must be local"; exit 1;; esac
-echo "[$(date +%T)] services ready"
+EFFECTIVE_LR=3e-5
+_prev=""
+for _arg in "$@"; do
+  if [ "$_prev" = "--lr" ]; then
+    EFFECTIVE_LR=$_arg
+    _prev=""
+  elif [[ "$_arg" == --lr=* ]]; then
+    EFFECTIVE_LR=${_arg#--lr=}
+  else
+    _prev=$_arg
+  fi
+done
+echo "[$(date +%T)] services ready (SUMMARY_VERSION=$SUMMARY_VERSION, effective lr=$EFFECTIVE_LR)"
 
 cd "$HERE"
 CUDA_VISIBLE_DEVICES=0 python "${RL_ENTRY:-rl/train_grpo.py}" --model "$MODEL" --train "$TRAIN" --dev "$DEV" \

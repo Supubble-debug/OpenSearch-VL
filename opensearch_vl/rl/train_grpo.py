@@ -187,17 +187,18 @@ class Roller:
             acc, judge_failed = int(res["acc"]), bool(res.get("judge_failed"))
         hit_str = R.retrieval_hit(turns, gold, aliases)
         hit, ev_called, ev_failed = hit_str, False, False
-        short = R.is_short_gold(gold)
-        # Evidence judge only where it can change the reward: answered, wrong, non-short gold
-        # (correct answers get query = 1; short golds use acc; unanswered rollouts get 0).
-        if evidence and self.args.query_signal == "evidence" and stop == "response" and not acc and not judge_failed and not short:
+        use_ev = evidence and self.args.query_signal == "evidence"
+        skip_query = R.is_yesno_gold(gold) if use_ev else R.is_short_gold(gold)
+        # Evidence judge only where it can change the reward: answered, wrong, non-skipped gold
+        # (correct answers get query = 1; skipped golds use acc; unanswered rollouts get 0).
+        if use_ev and stop == "response" and not acc and not judge_failed and not skip_query:
             ev_called = True
             ev = EJ.judge(row["prompt"][0]["content"], R.judge_gold(gold, aliases), turns)
             if ev is None:
                 ev_failed, judge_failed, hit = True, True, 0  # the group is dropped, as for answer-judge failures
             else:
                 hit = int(ev)
-        score = R.combine(stop, fmt, acc, hit, short)
+        score = R.combine(stop, fmt, acc, hit, skip_query)
         return {"data_id": row["data_id"], "k": k, "stop": stop, "fatal": stop == "fatal",
                 "fatal_turn": fatal_turn, "contents": traj.get("contents"), "n_turns": len(turns),
                 "n_tools": sum(1 for t in turns if t.get("tool_call")), **tool_counts(turns),
@@ -334,6 +335,11 @@ class Policy:
         opt_path = os.path.join(resume, "optimizer.pt")
         if os.path.exists(opt_path):
             self.opt.load_state_dict(torch.load(opt_path, map_location="cuda:0"))
+            for pg in self.opt.param_groups:
+                pg["lr"] = args.lr
+            log.info("resumed optimizer %s (effective lr=%g)", opt_path, self.opt.param_groups[0]["lr"])
+        else:
+            log.info("initialized optimizer (effective lr=%g)", self.opt.param_groups[0]["lr"])
 
     def encode(self, contents: List[Dict[str, Any]], fatal_turn: Any):
         """SFT-identical rendering -> (input_ids, loss mask, mm inputs) or None if too long/empty."""
@@ -512,7 +518,13 @@ def main() -> int:
     log.info("train %d q, dev %d q", len(train), 0 if dev is None else len(dev))
 
     R.set_weights(args.w_acc, args.w_query)
-    log.info("reward weights acc=%.2f query=%.2f", R.W_ACC, R.W_QUERY)
+    log.info(
+        "reward weights acc=%.2f query=%.2f summary_version=%s lr=%g",
+        R.W_ACC,
+        R.W_QUERY,
+        config.get_summary_version(),
+        args.lr,
+    )
     roller = Roller(args)
     policy = Policy(args, roller)
     metrics = Metrics(args.metrics)
@@ -613,7 +625,11 @@ def main() -> int:
         t_roll = time.time() - t0
         samples = []
         for g in kept.values():
-            adv = R.advantages([r["reward"] for r in g], [r["fatal"] for r in g], args.estimator)
+            adv = R.advantages(
+                [r["reward"] for r in g],
+                [r["fatal"] or r["stop"] == "max_turns" for r in g],
+                args.estimator,
+            )
             for r, a in zip(g, adv):
                 samples.append({**r, "adv": a})
         info = summarize(groups, "rollout")
